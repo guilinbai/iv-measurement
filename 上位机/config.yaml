@@ -1,0 +1,62 @@
+# ============================================================================
+#  4 路 IV 测量系统 · 上位机配置
+#  ---------------------------------------------------------------------------
+#  带 ★ 的值是这台电脑上实测/推荐值（DMM6500 两台 + Arduino Nano 都在线）
+#  修改后重启程序生效
+# ============================================================================
+
+storage:
+  # 数据根目录：程序会在下面按天自动建子文件夹，如 D:\IV_data\2026-10-30\
+  dir: "D:/IV_data"
+  write_csv_realtime: true     # ★ 边测边写 CSV 副本（防"忘记导出"，崩溃/断电也不怕）
+  verify_on_exit: true         # 关闭时校验 CSV 与数据库是否一致，缺则补齐
+  archive_daily: false         # 每天 00:05 归档前一天（可选）
+
+acquisition:
+  interval_s: 2.0              # ★ 采样间隔 = 周期（相邻两轮开始时刻之差）
+  channels: 4                  # 通道数
+  # 采集范围固定：每轮 4 路 × (V+I) = 8 项，不做通道选择
+  # 空通道照测，事后按 ch 字段筛掉即可
+
+devices:
+  # ---- 测电压的表（当前功能应为 VOLT:DC）----
+  dmm_voltage:
+    resource: "USB0::0x05E6::0x6500::04587682::INSTR"   # ★ 实测地址
+    idn_serial: "04587682"                              # 用于断线后重新识别
+    nplc: 1                     # 1 NPLC ≈ 20 ms/次（实测 :READ? 24 ms）
+    autozero: true              # 自动调零（小信号建议开）
+    autorange: false
+    range: 0.1                  # 100 mV 档（你的器件是 mV~V 级）
+    meas_func: "VOLT:DC"
+
+  # ---- 测电流的表（当前功能应为 CURR:DC）----
+  dmm_current:
+    resource: "USB0::0x05E6::0x6500::04468141::INSTR"   # ★ 实测地址
+    idn_serial: "04468141"
+    nplc: 1
+    autozero: true
+    autorange: false
+    range: 1e-05                # 10 µA 档（实测本底仅 ±20~50 pA）
+    meas_func: "CURR:DC"
+
+  # ---- 控制开关阵列的 Arduino ----
+  arduino:
+    port: ""                    # 留空 = 自动探测（推荐，因为 USB 会重新枚举换号）
+    baud: 115200
+    timeout_s: 1.0
+    heartbeat_s: 5              # 每隔几秒发一次 PING 喂看门狗（固件 10 s 超时）
+
+timing:
+  # 与固件里的值保持一致（仅用于"本轮耗时估算 + 间隔保护"，不用于实际控制）
+  t_open_ms: 30
+  t_settle_ms: 80
+  t_window_ms: 50               # ★ 实测 :READ? 24 ms，50 ms 有 2 倍余量
+  t_off_ms: 20
+  switch_overhead_ms: 40        # 一轮内两次耦合器切换的总开销
+  # 由以上推出：一轮 ≈ 8×(30+80+50+20+10) + 40 = 1560 ms
+  # 间隔保护阈值：若 interval_s < 一轮耗时 × 1.2 (=1.87 s) 就红色警告
+
+ui:
+  refresh_hz: 3                 # 界面刷新率（降采样后绘图耗时与数据量无关）
+  default_view: "1h"            # 10m / 1h / 1d / 7d
+  downsample_buckets: 1600      # 降采样后的目标点数（≈ 屏幕像素宽）

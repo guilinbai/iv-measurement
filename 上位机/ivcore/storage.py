@@ -1,0 +1,530 @@
+# -*- coding: utf-8 -*-
+"""
+数据存储
+================================================================================
+    Storage     SQLite（WAL）主存储 + CSV 实时副本（宽表）+ 多分辨率聚合表
+
+★ 数据格式（本版按用户要求改为宽表）
+--------------------------------------------------------------------------------
+CSV 实时副本：**一行一轮**，时间列严格等间隔（= 采样间隔）
+
+    iso_time,round_id,v1,i1,v2,i2,v3,i3,v4,i4
+    2026-10-12 14:23:37,1,1.4231,9.87e-05,1.4203,9.88e-05,...
+    2026-10-12 14:23:39,2,1.4233,9.87e-05,1.4201,9.86e-05,...
+
+  · 第 1 列 iso_time：**只到秒**，且严格按采样间隔递增
+    （用"本轮网格时刻" t_grid0 + n×interval，不是各点的物理测量时刻）
+  · 第 2 列 round_id：轮号，在**同一个数据库文件（同一天）内连续递增**，
+    不随程序重启重置 —— 所以重启后的数据也能按 round_id 排序
+  · 后 8 列：v1,i1,v2,i2,v3,i3,v4,i4（通道数可变，由 nch 决定）
+  · 某轮某项读数失败 → 该格留空（不是写 0，避免误判）
+  · 某轮整体失败 → 仍写一行（数据列全空），保证时间列**不断档**
+
+SQLite 主存储保留完整信息（追溯用）：
+  samples.ts        每个测量点的**物理时刻**（精确到微秒）
+  samples.grid_ts   该点所属轮次的**网格时刻**（严格等间隔）
+  samples.run_id    第几次运行会话（每启动一次 main.py 就是一个 run）
+  samples.quality   0=正常 1=可疑 2=无效（读数失败）
+  runs / events     运行记录与事件日志
+
+其它设计（对应方案文档 §6/§13）：
+  · 按天分目录：<root>/YYYY-MM-DD/YYYY-MM-DD.db + _samples.csv
+  · 文件名零填充 → 字符串排序 == 时间排序
+  · WAL 模式：断电/崩溃不损坏（最多回滚最后一个未提交事务）
+  · 每轮 commit 一次 + CSV flush → 边测边落盘
+  · 写入时顺手更新聚合表（1 分钟 / 1 小时）→ 7 天视图查询 <10 ms
+"""
+
+import csv
+import json
+import os
+import sqlite3
+import time
+from datetime import datetime
+
+HEAD_COLS = ["iso_time", "round_id"]
+
+
+def _iso_sec(ts):
+    """只到秒（用户要求的时间列精度）。"""
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _iso_ms(ts):
+    d = datetime.fromtimestamp(ts)
+    return d.strftime("%Y-%m-%d %H:%M:%S.") + "%03d" % (d.microsecond // 1000)
+
+
+def _fmt_val(v):
+    if v is None:
+        return ""
+    if isinstance(v, float):
+        return "%.6g" % v
+    return str(v)
+
+
+class Storage:
+    """按天分库的存储（宽表 CSV + 长表 SQLite）。"""
+
+    SCHEMA = """
+    CREATE TABLE IF NOT EXISTS samples (
+        ts       REAL NOT NULL,      -- 物理测量时刻
+        grid_ts  REAL,               -- 所属轮次的网格时刻（等间隔）
+        run_id   INTEGER,
+        round_id INTEGER,
+        ch       INTEGER,
+        mode     TEXT,
+        value    REAL,
+        unit     TEXT,
+        quality  INTEGER DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS runs (
+        id          INTEGER PRIMARY KEY,
+        start_ts    REAL,
+        end_ts      REAL,
+        config_json TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS events (
+        ts    REAL,
+        level TEXT,
+        src   TEXT,
+        msg   TEXT
+    );
+
+    -- 每轮一行（含"整体失败的空轮"）—— 让宽表能被完整重建、校验才准确
+    CREATE TABLE IF NOT EXISTS round_log (
+        grid_ts  REAL PRIMARY KEY,
+        round_id INTEGER,
+        run_id   INTEGER,
+        n_ok     INTEGER,
+        n_bad    INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS agg_1min (
+        bucket INTEGER, ch INTEGER, mode TEXT,
+        v_min REAL, v_max REAL, v_avg REAL, n INTEGER,
+        PRIMARY KEY (bucket, ch, mode)
+    );
+    CREATE TABLE IF NOT EXISTS agg_1hour (
+        bucket INTEGER, ch INTEGER, mode TEXT,
+        v_min REAL, v_max REAL, v_avg REAL, n INTEGER,
+        PRIMARY KEY (bucket, ch, mode)
+    );
+    """
+
+    # 索引单独建：必须在 _migrate() 补齐新列之后执行，
+    # 否则老库（缺 grid_ts 列）会因为 "no such column" 报错。
+    INDEXES = """
+    CREATE INDEX IF NOT EXISTS idx_samples_ts      ON samples(ts);
+    CREATE INDEX IF NOT EXISTS idx_samples_grid    ON samples(grid_ts);
+    CREATE INDEX IF NOT EXISTS idx_samples_ch_mode ON samples(ch, mode, ts);
+    """
+
+    def __init__(self, root, write_csv=True, nch=4, verbose=True):
+        self.root = os.path.abspath(root)
+        self.write_csv = write_csv
+        self.nch = int(nch)
+        self.verbose = verbose
+
+        # 宽表列：iso_time, round_id, v1, i1, v2, i2, ...
+        self.csv_cols = list(HEAD_COLS)
+        for ch in range(1, self.nch + 1):
+            self.csv_cols += ["v%d" % ch, "i%d" % ch]
+
+        self.con = None
+        self.db = None
+        self.csv_file = None
+        self.csv_writer = None
+        self.day = None
+
+        self.run_id = None
+        self.round_id = 0
+        self.n_written = 0
+        self.n_csv = 0
+        self._pending_agg = {}
+
+        os.makedirs(self.root, exist_ok=True)
+        self._rollover(force=True)
+
+    # ------------------------------------------------------------------
+    #  按天切换
+    # ------------------------------------------------------------------
+    def _day_dir(self, day):
+        return os.path.join(self.root, day)
+
+    def _rollover(self, force=False, ts=None):
+        day = datetime.fromtimestamp(ts).strftime("%Y-%m-%d") if ts else \
+            datetime.now().strftime("%Y-%m-%d")
+        if not force and day == self.day:
+            return False
+
+        self._close_files()
+        self.day = day
+        d = self._day_dir(day)
+        os.makedirs(d, exist_ok=True)
+
+        db_path = os.path.join(d, "%s.db" % day)
+        self.con = sqlite3.connect(db_path, timeout=10.0)
+        self.con.execute("PRAGMA journal_mode=WAL")
+        self.con.execute("PRAGMA synchronous=NORMAL")
+        self.con.executescript(self.SCHEMA)
+        self.con.commit()
+        self._migrate()                        # ① 先给老库补列
+        self.con.executescript(self.INDEXES)   # ② 再建索引（依赖新列）
+        self.con.commit()
+        self.db = db_path
+
+        # round_id 在同一天内连续递增（不随重启重置）
+        r = self.con.execute("SELECT MAX(round_id) FROM samples").fetchone()
+        base = r[0] if r and r[0] else 0
+        self.round_id = int(base)
+        self._round_base = int(base)
+
+        if self.write_csv:
+            csv_path = os.path.join(d, "%s_samples.csv" % day)
+            new = (not os.path.exists(csv_path)) or os.path.getsize(csv_path) == 0
+            self.csv_file = open(csv_path, "a", newline="", encoding="utf-8")
+            self.csv_writer = csv.writer(self.csv_file)
+            if new:
+                self.csv_writer.writerow(self.csv_cols)
+                self.csv_file.flush()
+            self.n_csv = self._count_csv_rows(csv_path)
+
+        if self.verbose:
+            print("      存储: %s  (宽表 %d 列, 已有轮号到 %d)"
+                  % (db_path, len(self.csv_cols), self.round_id))
+        return True
+
+    def _migrate(self):
+        """老库补列（例如上一版没有 grid_ts）。"""
+        try:
+            cols = [r[1] for r in self.con.execute("PRAGMA table_info(samples)")]
+            if "grid_ts" not in cols:
+                self.con.execute("ALTER TABLE samples ADD COLUMN grid_ts REAL")
+                self.con.execute(
+                    "UPDATE samples SET grid_ts = ts WHERE grid_ts IS NULL")
+                self.con.commit()
+                if self.verbose:
+                    print("      (已给旧库补上 grid_ts 列)")
+        except Exception:
+            pass
+
+    def _close_files(self):
+        if self.con:
+            try:
+                self._flush_agg()
+                self.con.commit()
+                self.con.close()
+            except Exception:
+                pass
+            self.con = None
+        if self.csv_file:
+            try:
+                self.csv_file.flush()
+                self.csv_file.close()
+            except Exception:
+                pass
+            self.csv_file = None
+            self.csv_writer = None
+
+    @staticmethod
+    def _count_csv_rows(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return max(0, sum(1 for _ in f) - 1)
+        except Exception:
+            return 0
+
+    # ------------------------------------------------------------------
+    #  轮号
+    # ------------------------------------------------------------------
+    @property
+    def round_base(self):
+        return getattr(self, "_round_base", 0)
+
+    def begin_round(self):
+        """分配一个新轮号（当天内连续）。"""
+        self.round_id += 1
+        return self.round_id
+
+    # ------------------------------------------------------------------
+    #  运行/事件
+    # ------------------------------------------------------------------
+    def start_run(self, config_snapshot):
+        cur = self.con.execute(
+            "INSERT INTO runs (start_ts, end_ts, config_json) VALUES (?,?,?)",
+            (time.time(), None, json.dumps(config_snapshot, ensure_ascii=False)))
+        self.run_id = cur.lastrowid
+        self.con.commit()
+        return self.run_id
+
+    def end_run(self):
+        if self.run_id:
+            self.con.execute("UPDATE runs SET end_ts=? WHERE id=?",
+                             (time.time(), self.run_id))
+            self.con.commit()
+
+    def event(self, level, src, msg):
+        ts = time.time()
+        try:
+            self.con.execute("INSERT INTO events (ts, level, src, msg) VALUES (?,?,?,?)",
+                             (ts, level, src, msg))
+            self.con.commit()
+        except Exception:
+            pass
+        if self.verbose:
+            print("      [%s] %s: %s" % (level, src, msg))
+
+    # ------------------------------------------------------------------
+    #  写一轮
+    # ------------------------------------------------------------------
+    def write_round(self, samples, grid_ts=None, round_id=None):
+        """写一轮数据。
+
+        samples : [(ts, ch, mode, value, unit, quality), ...]
+                  可以为空（该轮整体失败）——仍会在 CSV 里写一行，
+                  以保证时间列不断档。
+        grid_ts : 本轮的"网格时刻"（严格等间隔）。缺省用第一个点或现在。
+        round_id: 轮号。缺省用 self.round_id（需先 begin_round()）。
+        """
+        if round_id is None:
+            round_id = self.round_id
+        if grid_ts is None:
+            grid_ts = samples[0][0] if samples else time.time()
+
+        self._rollover(ts=grid_ts)
+
+        # ---- SQLite（长表，保留精确信息）----
+        rows = [(ts, grid_ts, self.run_id, round_id, ch, mode, val, unit, q)
+                for (ts, ch, mode, val, unit, q) in samples if val is not None]
+        if rows:
+            self.con.executemany(
+                "INSERT INTO samples (ts, grid_ts, run_id, round_id, ch, mode,"
+                " value, unit, quality) VALUES (?,?,?,?,?,?,?,?,?)", rows)
+            self.con.commit()
+            self.n_written += len(rows)
+
+        # ---- 轮记录（空轮也留痕，保证时间列不断档、校验准确）----
+        n_bad = sum(1 for s in samples if s[3] is None)
+        self.con.execute(
+            "INSERT INTO round_log (grid_ts, round_id, run_id, n_ok, n_bad)"
+            " VALUES (?,?,?,?,?)"
+            " ON CONFLICT(grid_ts) DO UPDATE SET"
+            "   n_ok = n_ok + excluded.n_ok, n_bad = n_bad + excluded.n_bad",
+            (grid_ts, round_id, self.run_id, len(rows), n_bad))
+        self.con.commit()
+
+        # ---- CSV（宽表，一行一轮）----
+        if self.csv_writer:
+            d = {}
+            for (ts, ch, mode, val, unit, q) in samples:
+                d["%s%d" % (mode.lower(), ch)] = val
+            row = [_iso_sec(grid_ts), round_id]
+            row += [_fmt_val(d.get(c)) for c in self.csv_cols[2:]]
+            self.csv_writer.writerow(row)
+            self.csv_file.flush()               # 实时副本：立刻落盘
+            self.n_csv += 1
+
+        # ---- 聚合 ----
+        for (ts, ch, mode, val, unit, q) in samples:
+            if val is not None:
+                self._agg_add(grid_ts, ch, mode, val)
+        self._flush_agg()
+
+        return len(rows)
+
+    def _agg_add(self, ts, ch, mode, val):
+        for name, width in (("agg_1min", 60), ("agg_1hour", 3600)):
+            bucket = int(ts // width) * width
+            key = (name, bucket, ch, mode)
+            cur = self._pending_agg.get(key)
+            if cur is None:
+                self._pending_agg[key] = [val, val, val, 1]
+            else:
+                cur[0] = min(cur[0], val)
+                cur[1] = max(cur[1], val)
+                cur[2] += val
+                cur[3] += 1
+
+    def _flush_agg(self):
+        if not self._pending_agg:
+            return
+        for (name, bucket, ch, mode), (vmin, vmax, vsum, n) in self._pending_agg.items():
+            self.con.execute(
+                "INSERT INTO %s (bucket, ch, mode, v_min, v_max, v_avg, n)"
+                " VALUES (?,?,?,?,?,?,?)"
+                " ON CONFLICT(bucket, ch, mode) DO UPDATE SET"
+                "   v_min = MIN(v_min, excluded.v_min),"
+                "   v_max = MAX(v_max, excluded.v_max),"
+                "   v_avg = (v_avg * n + excluded.v_avg * excluded.n) / (n + excluded.n),"
+                "   n     = n + excluded.n" % name,
+                (bucket, ch, mode, vmin, vmax, vsum / n, n))
+        self.con.commit()
+        self._pending_agg.clear()
+
+    # ------------------------------------------------------------------
+    #  查询
+    # ------------------------------------------------------------------
+    def last_ts(self):
+        try:
+            r = self.con.execute("SELECT MAX(grid_ts) FROM samples").fetchone()
+            return r[0] if r and r[0] else None
+        except Exception:
+            return None
+
+    def last_round_id(self):
+        try:
+            r = self.con.execute("SELECT MAX(round_id) FROM samples").fetchone()
+            return r[0] if r and r[0] else 0
+        except Exception:
+            return 0
+
+    def counts(self):
+        """(数据库测量值行数, CSV 轮数)"""
+        try:
+            db_n = self.con.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
+        except Exception:
+            db_n = -1
+        return db_n, self.n_csv
+
+    def query_range(self, t0, t1, chs=None, modes=None, limit=None):
+        sql = ("SELECT ts, grid_ts, ch, mode, value, unit, quality FROM samples"
+               " WHERE ts>=? AND ts<=?")
+        args = [t0, t1]
+        if chs:
+            sql += " AND ch IN (%s)" % ",".join("?" * len(chs))
+            args += list(chs)
+        if modes:
+            sql += " AND mode IN (%s)" % ",".join("?" * len(modes))
+            args += list(modes)
+        sql += " ORDER BY ts"
+        if limit:
+            sql += " LIMIT %d" % int(limit)
+        return self.con.execute(sql, args).fetchall()
+
+    def query_wide(self, t0=None, t1=None, chs=None, modes=None):
+        """按轮聚合的宽表数据：[(grid_ts, round_id, {mode+ch: value}), ...]"""
+        sql = ("SELECT grid_ts, round_id, ch, mode, value FROM samples WHERE 1=1")
+        args = []
+        if t0 is not None:
+            sql += " AND grid_ts>=?"; args.append(t0)
+        if t1 is not None:
+            sql += " AND grid_ts<=?"; args.append(t1)
+        sql += " ORDER BY grid_ts"
+        out = {}
+        for gts, rid, ch, mode, val in self.con.execute(sql, args):
+            key = (gts, rid)
+            out.setdefault(key, {})["%s%d" % (mode.lower(), ch)] = val
+        return [(gts, rid, d) for (gts, rid), d in sorted(out.items())]
+
+    def query_agg(self, table, t0, t1, chs=None, modes=None):
+        sql = ("SELECT bucket, ch, mode, v_min, v_max, v_avg, n FROM %s"
+               " WHERE bucket>=? AND bucket<=?" % table)
+        args = [t0, t1]
+        if chs:
+            sql += " AND ch IN (%s)" % ",".join("?" * len(chs))
+            args += list(chs)
+        if modes:
+            sql += " AND mode IN (%s)" % ",".join("?" * len(modes))
+            args += list(modes)
+        sql += " ORDER BY bucket"
+        return self.con.execute(sql, args).fetchall()
+
+    # ------------------------------------------------------------------
+    #  关闭时校验补齐
+    # ------------------------------------------------------------------
+    def verify_and_repair(self, log=print):
+        """校验 CSV 轮数是否与数据库一致，缺则按宽表重写。"""
+        if not self.write_csv:
+            return True, "未启用实时 CSV（跳过校验）"
+        try:
+            db_rounds = self.con.execute("SELECT COUNT(*) FROM round_log").fetchone()[0]
+        except Exception:
+            db_rounds = 0
+        if db_rounds == self.n_csv:
+            return True, "一致（%d 轮）" % self.n_csv
+
+        log("      CSV 轮数(%d) 与数据库(%d) 不一致，正在按宽表补齐…"
+            % (self.n_csv, db_rounds))
+        path = os.path.join(self._day_dir(self.day), "%s_samples.csv" % self.day)
+
+        # ★ Windows 不允许替换仍被打开的文件：先关掉 CSV 句柄
+        if self.csv_file:
+            try:
+                self.csv_file.flush()
+                self.csv_file.close()
+            except Exception:
+                pass
+            self.csv_file = None
+            self.csv_writer = None
+
+        try:
+            tmp = path + ".tmp"
+            written = 0
+            with open(tmp, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(self.csv_cols)
+                for gts, rid, d in self.query_wide():
+                    w.writerow([_iso_sec(gts), rid]
+                               + [_fmt_val(d.get(c)) for c in self.csv_cols[2:]])
+                    written += 1
+            os.replace(tmp, path)
+            self.n_csv = written            # ★ 记实际写出的行数，不是数据库轮数
+            ok_msg = "已重写为 %d 轮" % written
+            err = None
+        except Exception as e:
+            ok_msg, err = None, "补齐失败: %s" % e
+
+        # 重新打开 CSV 供后续追加
+        try:
+            self.csv_file = open(path, "a", newline="", encoding="utf-8")
+            self.csv_writer = csv.writer(self.csv_file)
+        except Exception:
+            pass
+
+        return (err is None), (ok_msg if err is None else err)
+
+    def close(self):
+        self._close_files()
+
+
+# ============================================================================
+#  自测
+# ============================================================================
+if __name__ == "__main__":
+    import sys, tempfile
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+    root = os.path.join(tempfile.gettempdir(), "iv_store_test2")
+    print("测试目录:", root)
+    st = Storage(root, nch=4)
+    st.start_run({"test": True})
+    t0 = time.time()
+    for rd in range(1, 4):
+        gts = t0 + (rd - 1) * 2.0            # 网格：严格 2 秒
+        s = []
+        for ch in (1, 2, 3, 4):
+            for mode in ("V", "I"):
+                v = 1.4 + 0.01 * rd if mode == "V" else 0.0098 + 0.0001 * ch
+                s.append((gts + ch * 0.19 + (0 if mode == "V" else 0.76), ch, mode,
+                          v, "V" if mode == "V" else "A", 0))
+        st.begin_round()
+        st.write_round(s, grid_ts=gts)
+    # 再写一轮"整体失败"（空数据），验证时间列不断档
+    st.begin_round()
+    st.write_round([], grid_ts=t0 + 3 * 2.0)
+    print("计数 (db行, csv轮):", st.counts())
+    print("校验:", st.verify_and_repair())
+    st.end_run()
+    st.close()
+
+    csv_path = os.path.join(root, st.day, "%s_samples.csv" % st.day)
+    print("\n生成的宽表 CSV:")
+    with open(csv_path, encoding="utf-8") as f:
+        for line in f:
+            print("   " + line.rstrip())

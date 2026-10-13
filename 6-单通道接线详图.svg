@@ -1,0 +1,161 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="1070" viewBox="0 0 1440 1070" font-family="Microsoft YaHei,SimHei,sans-serif">
+  <style>
+    path{fill:none;stroke-linecap:round;stroke-linejoin:round}
+    .cb{stroke:#1a4d8f;stroke-width:2.5}
+    .cm{stroke:#1e7a3c;stroke-width:2.5}
+    .cp{stroke:#7d3c98;stroke-width:2.5}
+    .ch{stroke:#c0392b;stroke-width:3.5}
+    .cl{stroke:#2c3e50;stroke-width:3.5}
+    text{fill:#111}
+  </style>
+  <rect width="1440" height="1070" fill="#ffffff"/>
+
+  <text x="40" y="46" font-size="25" font-weight="bold">单通道接线详图（通道 1）—— 看清 1kΩ 电阻接在哪里</text>
+  <text x="40" y="78" font-size="15" fill="#555">Arduino 引脚 → 1kΩ 限流电阻 → 光耦 1 脚（LED 阳极）；光耦 2 脚 → 控制侧 GND；光耦 3/4 脚 → 测量侧（器件与母线），两侧不共地</text>
+
+  <!-- 背景两半 -->
+  <rect x="30" y="112" width="660" height="556" rx="10" fill="#f2f7ff" stroke="#cfdcf0"/>
+  <rect x="716" y="112" width="694" height="556" rx="10" fill="#f2fbf4" stroke="#c6e3ce"/>
+  <text x="50" y="142" font-size="16" font-weight="bold" fill="#1a4d8f">① 控制侧（5 V 逻辑，蓝色线）</text>
+  <text x="736" y="142" font-size="16" font-weight="bold" fill="#1e7a3c">② 测量侧（浮空、不共地，绿/紫/红线）</text>
+
+  <!-- 隔离边界 -->
+  <path d="M705 118 V662" stroke="#8e44ad" stroke-width="2.5" stroke-dasharray="12 7"/>
+  <rect x="643" y="88" width="124" height="26" rx="6" fill="#f6ecfb" stroke="#8e44ad"/>
+  <text x="705" y="106" font-size="13" font-weight="bold" text-anchor="middle" fill="#6c3483">光隔离边界</text>
+
+  <!-- Arduino -->
+  <rect x="50" y="180" width="175" height="425" rx="8" fill="#e8f0fb" stroke="#33507a" stroke-width="2"/>
+  <text x="137" y="212" font-size="16" font-weight="bold" text-anchor="middle" fill="#1a4d8f">Arduino Nano</text>
+  <circle cx="225" cy="205" r="4.5" fill="#1a4d8f"/><text x="217" y="199" font-size="14" font-weight="bold" text-anchor="end" fill="#1a4d8f">D2</text>
+  <circle cx="225" cy="365" r="4.5" fill="#1a4d8f"/><text x="217" y="359" font-size="14" font-weight="bold" text-anchor="end" fill="#1a4d8f">D3</text>
+  <circle cx="225" cy="465" r="4.5" fill="#1a4d8f"/><text x="217" y="459" font-size="14" font-weight="bold" text-anchor="end" fill="#1a4d8f">GND</text>
+
+  <!-- 三个限流电阻 -->
+  <rect x="280" y="187" width="80" height="36" rx="3" fill="#fff" stroke="#1a4d8f" stroke-width="2.5"/>
+  <text x="320" y="177" font-size="15" font-weight="bold" text-anchor="middle" fill="#c0392b">R1 = 1kΩ</text>
+  <rect x="280" y="347" width="80" height="36" rx="3" fill="#fff" stroke="#1a4d8f" stroke-width="2.5"/>
+  <text x="320" y="337" font-size="15" font-weight="bold" text-anchor="middle" fill="#c0392b">R2 = 1kΩ</text>
+  <rect x="280" y="507" width="80" height="36" rx="3" fill="#fff" stroke="#1a4d8f" stroke-width="2.5"/>
+  <text x="320" y="497" font-size="15" font-weight="bold" text-anchor="middle" fill="#c0392b">R3 = 1kΩ</text>
+
+  <!-- 控制侧走线 -->
+  <path class="cb" d="M225 205 H280"/>
+  <circle cx="250" cy="205" r="5" fill="#1a4d8f"/>
+  <path class="cb" d="M250 205 V357 A9 9 0 0 1 250 373 V525 H280"/>
+  <path class="cb" d="M225 365 H280"/>
+  <path class="cb" d="M360 205 H605"/>
+  <path class="cb" d="M360 365 H605"/>
+  <path class="cb" d="M360 525 H605"/>
+  <path class="cb" d="M225 465 H245 V487"/>
+  <path class="cb" d="M237 487 H253 M240 494 H250 M243 501 H247"/>
+  <text x="262" y="455" font-size="12" fill="#1a4d8f">控制侧 GND</text>
+
+  <!-- 光耦 1 -->
+  <rect x="605" y="175" width="200" height="100" rx="6" fill="#fffaf0" stroke="#e08a00" stroke-width="2.5"/>
+  <text x="705" y="196" font-size="14" font-weight="bold" text-anchor="middle" fill="#a35b00">光耦-1（选通A）</text>
+  <path d="M625 195 L648 205 L625 215" fill="#c0392b" stroke="#c0392b" stroke-width="2"/>
+  <path d="M650 193 V217" stroke="#c0392b" stroke-width="3"/>
+  <path d="M658 198 L680 186 M658 212 L680 200" stroke="#e08a00" stroke-width="2"/>
+  <text x="672" y="238" font-size="11" text-anchor="middle" fill="#a35b00">LED</text>
+  <path d="M740 205 H752 M762 205 H782" stroke="#a35b00" stroke-width="2"/>
+  <path d="M782 199 V211" stroke="#a35b00" stroke-width="3"/>
+  <text x="762" y="238" font-size="11" text-anchor="middle" fill="#a35b00">MOSFET</text>
+  <text x="614" y="201" font-size="12" fill="#a35b00">1</text><text x="614" y="259" font-size="12" fill="#a35b00">2</text>
+  <text x="784" y="201" font-size="12" fill="#a35b00">4</text><text x="784" y="259" font-size="12" fill="#a35b00">3</text>
+
+  <!-- 光耦 3（短接，放中间便于连线） -->
+  <rect x="605" y="335" width="200" height="100" rx="6" fill="#fffaf0" stroke="#e08a00" stroke-width="2.5"/>
+  <text x="705" y="356" font-size="14" font-weight="bold" text-anchor="middle" fill="#a35b00">光耦-3（短接）</text>
+  <path d="M625 355 L648 365 L625 375" fill="#c0392b" stroke="#c0392b" stroke-width="2"/>
+  <path d="M650 353 V377" stroke="#c0392b" stroke-width="3"/>
+  <path d="M658 358 L680 346 M658 372 L680 360" stroke="#e08a00" stroke-width="2"/>
+  <text x="672" y="398" font-size="11" text-anchor="middle" fill="#a35b00">LED</text>
+  <path d="M740 365 H752 M762 365 H782" stroke="#a35b00" stroke-width="2"/>
+  <path d="M782 359 V371" stroke="#a35b00" stroke-width="3"/>
+  <text x="762" y="398" font-size="11" text-anchor="middle" fill="#a35b00">MOSFET</text>
+  <text x="614" y="361" font-size="12" fill="#a35b00">1</text><text x="614" y="419" font-size="12" fill="#a35b00">2</text>
+  <text x="784" y="361" font-size="12" fill="#a35b00">3</text><text x="784" y="419" font-size="12" fill="#a35b00">4</text>
+
+  <!-- 光耦 2 -->
+  <rect x="605" y="495" width="200" height="100" rx="6" fill="#fffaf0" stroke="#e08a00" stroke-width="2.5"/>
+  <text x="705" y="516" font-size="14" font-weight="bold" text-anchor="middle" fill="#a35b00">光耦-2（选通B）</text>
+  <path d="M625 515 L648 525 L625 535" fill="#c0392b" stroke="#c0392b" stroke-width="2"/>
+  <path d="M650 513 V537" stroke="#c0392b" stroke-width="3"/>
+  <path d="M658 518 L680 506 M658 532 L680 520" stroke="#e08a00" stroke-width="2"/>
+  <text x="672" y="558" font-size="11" text-anchor="middle" fill="#a35b00">LED</text>
+  <path d="M740 525 H752 M762 525 H782" stroke="#a35b00" stroke-width="2"/>
+  <path d="M782 519 V531" stroke="#a35b00" stroke-width="3"/>
+  <text x="762" y="558" font-size="11" text-anchor="middle" fill="#a35b00">MOSFET</text>
+  <text x="614" y="521" font-size="12" fill="#a35b00">1</text><text x="614" y="579" font-size="12" fill="#a35b00">2</text>
+  <text x="784" y="521" font-size="12" fill="#a35b00">3</text><text x="784" y="579" font-size="12" fill="#a35b00">4</text>
+
+  <!-- 2 脚到 GND -->
+  <path class="cb" d="M605 245 H572 V262"/>
+  <path class="cb" d="M564 262 H580 M567 269 H577 M570 276 H574"/>
+  <path class="cb" d="M605 405 H572 V422"/>
+  <path class="cb" d="M564 422 H580 M567 429 H577 M570 436 H574"/>
+  <path class="cb" d="M605 565 H572 V582"/>
+  <path class="cb" d="M564 582 H580 M567 589 H577 M570 596 H574"/>
+
+  <!-- 测量侧：母线引出 -->
+  <path class="ch" d="M805 205 H1130"/>
+  <circle cx="1130" cy="205" r="5" fill="#c0392b"/>
+  <text x="1140" y="200" font-size="15" font-weight="bold" fill="#c0392b">母线 HI</text>
+  <text x="1140" y="220" font-size="12" fill="#c0392b">（→ 万用表）</text>
+  <path class="cl" d="M805 565 H1130"/>
+  <circle cx="1130" cy="565" r="5" fill="#2c3e50"/>
+  <text x="1140" y="560" font-size="15" font-weight="bold" fill="#2c3e50">母线 LO</text>
+  <text x="1140" y="580" font-size="12" fill="#2c3e50">（→ 万用表公共端）</text>
+
+  <!-- A 端节点 -->
+  <path class="cm" d="M805 245 H880"/>
+  <path class="cm" d="M805 365 H880"/>
+  <path class="cm" d="M880 245 V365"/>
+  <circle cx="880" cy="305" r="5" fill="#1e7a3c"/>
+  <path class="cm" d="M880 305 H1150"/>
+  <text x="900" y="298" font-size="12" fill="#1e7a3c">器件 A 端</text>
+
+  <!-- B 端节点 -->
+  <path class="cp" d="M805 405 H920"/>
+  <path class="cp" d="M805 525 H920"/>
+  <path class="cp" d="M920 405 V525"/>
+  <circle cx="920" cy="465" r="5" fill="#7d3c98"/>
+  <path class="cp" d="M920 465 H1150"/>
+  <text x="940" y="458" font-size="12" fill="#7d3c98">器件 B 端</text>
+
+  <!-- 器件 -->
+  <rect x="1150" y="290" width="210" height="230" rx="8" fill="#eaf7ee" stroke="#1e7a3c" stroke-width="2.5"/>
+  <text x="1255" y="360" font-size="16" font-weight="bold" text-anchor="middle" fill="#1e7a3c">被测器件 1</text>
+  <text x="1255" y="386" font-size="12" text-anchor="middle" fill="#3a7a55">（光伏/光电类，</text>
+  <text x="1255" y="404" font-size="12" text-anchor="middle" fill="#3a7a55">彼此独立、浮空）</text>
+  <text x="1255" y="440" font-size="12" text-anchor="middle" fill="#3a7a55">A 端在左（上）</text>
+  <text x="1255" y="458" font-size="12" text-anchor="middle" fill="#3a7a55">B 端在左（下）</text>
+  <circle cx="1150" cy="305" r="5" fill="#1e7a3c"/>
+  <circle cx="1150" cy="465" r="5" fill="#7d3c98"/>
+
+  <!-- 图例 -->
+  <path class="cb" d="M250 347 A9 9 0 0 1 250 373"/>
+  <text x="58" y="648" font-size="12" fill="#6c3483">半圆 = 两条线交叉但不相连</text>
+  <text x="58" y="630" font-size="12" fill="#555">图中把"短接"光耦放在中间只是为了好连线；</text>
+  <text x="58" y="612" font-size="12" fill="#555">实际面包板上按编号顺序插即可，电气完全等价。</text>
+
+  <!-- 说明 -->
+  <rect x="30" y="690" width="1380" height="350" rx="10" fill="#fff8e6" stroke="#e0b000"/>
+  <text x="52" y="722" font-size="18" font-weight="bold" fill="#8a6100">为什么需要 14 个 1kΩ 电阻？（CircuitJS 仿真图里看不到它，原因见第 4 条）</text>
+
+  <text x="52" y="756" font-size="15" font-weight="bold" fill="#333">1. 光耦的输入端就是一只红外 LED（1 脚 = 阳极，2 脚 = 阴极）</text>
+  <text x="72" y="782" font-size="14" fill="#444">LED 导通后自身压降约 1.25 V，Arduino 引脚输出 5 V，两者之差必须由电阻承担，否则电流会大到烧掉 LED 或引脚。</text>
+
+  <text x="52" y="814" font-size="15" font-weight="bold" fill="#333">2. 限流电阻的计算</text>
+  <text x="72" y="840" font-size="15" fill="#c0392b">I = (5 V − 1.25 V) ÷ 1 kΩ ≈ 3.75 mA　　（LED 规格 5~10 mA 都可用，取 1 kΩ 最稳妥）</text>
+
+  <text x="52" y="872" font-size="15" font-weight="bold" fill="#333">3. 为什么是 14 只而不是 1 只</text>
+  <text x="72" y="898" font-size="14" fill="#444">每只光耦的 1 脚各配一只：4 路 × 3 只 + 2 只模式耦合器 = <tspan font-weight="bold" fill="#c0392b">14 只光耦 → 14 只 1kΩ</tspan>。</text>
+  <text x="72" y="922" font-size="14" fill="#444">不能两只 LED 共用一只电阻（电流分配不均、亮度不同，甚至一只亮一只不亮）。</text>
+
+  <text x="52" y="954" font-size="15" font-weight="bold" fill="#333">4. 为什么仿真图里没有它</text>
+  <text x="72" y="980" font-size="14" fill="#444">CircuitJS 的"模拟开关"是<tspan font-weight="bold">理想电压控制开关</tspan>：控制端只判电压高低，不消耗电流，所以仿真里只画了电压控制端，</text>
+  <text x="72" y="1004" font-size="14" fill="#444">把 LED 侧整个省略了。真实电路里 LED 侧必须存在（这就是本图要补上的一课）。</text>
+  <text x="72" y="1028" font-size="13" fill="#8a6100">→ 结论：仿真图用来验证<tspan font-weight="bold">时序与逻辑</tspan>；LED 限流电阻、地线分区这些<tspan font-weight="bold">硬件细节</tspan>按本图与《5-面包板排线教程.md》接线。</text>
+</svg>
