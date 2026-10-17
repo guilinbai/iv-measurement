@@ -104,6 +104,14 @@ class AcquisitionWorker(QThread):
                 self._log("   %s 已配置: %s" % (name, dmm.summary()))
             except Exception as e:
                 self._log("[!] %s 配置出错（继续）: %s" % (name, str(e)[:80]))
+            # ★ 量程预热：让自动量程先稳定，避免第一轮因切换档位而拖慢/超时
+            try:
+                _vals, costs = dmm.warmup(n=3, verbose=False)
+                self._log("   %s 预热 3 次，%s，单次 %.0f~%.0f ms"
+                          % (name, dmm.summary(), min(costs) if costs else 0,
+                             max(costs) if costs else 0))
+            except Exception as e:
+                self._log("[!] %s 预热失败（继续）: %s" % (name, str(e)[:60]))
             if key == "dmm_voltage":
                 self.dmm_v = dmm
             else:

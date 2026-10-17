@@ -23,11 +23,13 @@ devices:
   dmm_voltage:
     resource: "USB0::0x05E6::0x6500::04587682::INSTR"   # ★ 实测地址
     idn_serial: "04587682"                              # 用于断线后重新识别
-    nplc: 1                     # 1 NPLC ≈ 20 ms/次（实测 :READ? 24 ms）
-    autozero: true              # 自动调零（小信号建议开）
-    autorange: false
-    range: 0.1                  # 100 mV 档（你的器件是 mV~V 级）
+    nplc: 1                     # 1 NPLC ≈ 20 ms/次（实测 :READ? 约 25 ms）
+    autozero: true              # 自动调零（小信号建议开；每 5 次读数会多花约 20 ms）
     meas_func: "VOLT:DC"
+    # ★★ 量程策略：默认用【自动量程】★★
+    #   锁死量程的话，被测值一旦超出该档位（如 Voc 超过 0.1 V）就会超量程报错。
+    autorange: true
+    # range: 0.1                # 仅当 autorange: false 时才生效（固定量程，谨慎用）
 
   # ---- 测电流的表（当前功能应为 CURR:DC）----
   dmm_current:
@@ -35,9 +37,9 @@ devices:
     idn_serial: "04468141"
     nplc: 1
     autozero: true
-    autorange: false
-    range: 1e-05                # 10 µA 档（实测本底仅 ±20~50 pA）
     meas_func: "CURR:DC"
+    autorange: true             # ★★ 同上：默认自动量程，不锁死 ★★
+    # range: 1e-05              # 仅当 autorange: false 时才生效
 
   # ---- 控制开关阵列的 Arduino ----
   arduino:
@@ -50,11 +52,13 @@ timing:
   # 与固件里的值保持一致（仅用于"本轮耗时估算 + 间隔保护"，不用于实际控制）
   t_open_ms: 30
   t_settle_ms: 80
-  t_window_ms: 50               # ★ 实测 :READ? 24 ms，50 ms 有 2 倍余量
+  t_window_ms: 80               # ★ 80 ms：实测读数约 25 ms，但"自动调零"每 5 次会到 43 ms，
+                                #    自动量程切换时更慢 → 留足余量（固件里也改成了 80）
   t_off_ms: 20
   switch_overhead_ms: 40        # 一轮内两次耦合器切换的总开销
-  # 由以上推出：一轮 ≈ 8×(30+80+50+20+10) + 40 = 1560 ms
-  # 间隔保护阈值：若 interval_s < 一轮耗时 × 1.2 (=1.87 s) 就红色警告
+  # 由以上推出：一轮 ≈ 8×(30+80+80+20+10) + 40 = 1800 ms
+  # 间隔保护阈值：若 interval_s < 一轮耗时 × 1.2 (=2.16 s) 就红色警告
+  # → 采样间隔建议用 2.5 s（或把 T_SETTLE 调小以压缩一轮耗时）
 
 ui:
   refresh_hz: 3                 # 界面刷新率（降采样后绘图耗时与数据量无关）

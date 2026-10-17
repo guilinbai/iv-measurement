@@ -202,8 +202,9 @@ class MainWindow(QWidget):
             self.lbl_hint.setStyleSheet("color:#1a7f37;")
         else:
             self.lbl_hint.setText(
-                "⚠ 一轮耗时 %.2f s 但间隔只有 %.2f s（余量 %.2f s）—— "
-                "数据会持续滞后！建议间隔 ≥ %.2f s，或调小 config.yaml 里的 timing"
+                "⚠ 一轮耗时 %.2f s ／ 间隔 %.2f s ／ 余量只有 %.2f s（低于 20%%）"
+                "—— 偶发抖动可能追不上；建议间隔 ≥ %.2f s，"
+                "或把 config.yaml 的 t_settle_ms 调小"
                 % (cost, iv, margin, min_iv))
             self.lbl_hint.setStyleSheet("color:#c0392b; font-weight:bold;")
 

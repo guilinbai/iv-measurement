@@ -109,6 +109,11 @@ def connect(cfg, args):
                           verbose=True)
         except Exception as e:
             print("    [!] 配置时出错（继续）: %s" % str(e)[:100])
+        # ★ 量程预热：让自动量程先稳定，避免第一轮因切换档位而拖慢/超时
+        try:
+            dmm.warmup(n=3, verbose=True)
+        except Exception as e:
+            print("    [!] 预热失败（继续）: %s" % str(e)[:80])
         dmms[key] = dmm
 
     return arduino, dmms["dmm_voltage"], dmms["dmm_current"]
@@ -144,10 +149,10 @@ def main():
 
     ok, iv = cfg.interval_ok()
     if not ok:
-        print("\n  [!] 警告：采样间隔 %.2f s < 一轮耗时 %.2f s，"
-              "实际周期会被拉长" % (iv, cfg.round_cost_s()))
-        print("      建议间隔 >= %.2f s，或调小 config.yaml 里的 timing 参数"
-              % cfg.min_interval_s())
+        print("\n  [!] 提醒：采样间隔 %.2f s 减去一轮耗时 %.2f s 后，余量只有 %.2f s"
+              % (iv, cfg.round_cost_s(), iv - cfg.round_cost_s()))
+        print("      （低于一轮耗时的 20%%，偶发抖动可能追不上）。建议间隔 >= %.2f s，"
+              "或把 config.yaml 里的 t_settle_ms 调小" % cfg.min_interval_s())
 
     # --- 存储 ---
     head("打开存储")

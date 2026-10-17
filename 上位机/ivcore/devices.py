@@ -269,30 +269,82 @@ class DMM:
     # ---- 配置 ----
     def configure(self, meas_func=None, nplc=None, autozero=None,
                   autorange=None, rng=None, verbose=True):
-        """按配置设置功能/量程/NPLC/自动调零。只改明确给出的项。"""
+        """按配置设置功能/量程/NPLC/自动调零。只改明确给出的项。
+
+        ★ 量程策略（重要）：
+          · autorange=True  → 开启自动量程，**不写** :SENS:RANG（锁死量程会超量程报错）
+          · autorange=False 且给了 rng → 才写固定量程（谨慎使用）
+          · autorange=None  → 量程不动（保持表原来的设置）
+        """
         if meas_func:
             self.inst.write(":SENS:FUNC \"%s\"" % meas_func)
-        if autorange is not None:
-            key = "VOLT" if "VOLT" in (meas_func or self.current_func()) else "CURR"
-            self.inst.write(":SENS:%s:RANG:AUTO %d" % (key, 1 if autorange else 0))
-        if rng is not None:
-            key = "VOLT" if "VOLT" in (meas_func or self.current_func()) else "CURR"
-            if not autorange:
-                self.inst.write(":SENS:%s:RANG %g" % (key, float(rng)))
+
+        f = self.current_func()
+        key = "VOLT" if "VOLT" in f.upper() else "CURR"
+
+        if autorange is True:
+            self.inst.write(":SENS:%s:RANG:AUTO 1" % key)
+        elif autorange is False and rng is not None:
+            self.inst.write(":SENS:%s:RANG:AUTO 0" % key)
+            self.inst.write(":SENS:%s:RANG %g" % (key, float(rng)))
+        elif autorange is False and rng is None:
+            self.inst.write(":SENS:%s:RANG:AUTO 0" % key)
+
         if nplc is not None:
-            for key in ("VOLT", "CURR"):
+            for k in ("VOLT", "CURR"):
                 try:
-                    self.inst.write(":SENS:%s:NPLC %g" % (key, float(nplc)))
+                    self.inst.write(":SENS:%s:NPLC %g" % (k, float(nplc)))
                 except Exception:
                     pass
         if autozero is not None:
-            for key in ("VOLT", "CURR"):
+            for k in ("VOLT", "CURR"):
                 try:
-                    self.inst.write(":SENS:%s:AZER %d" % (key, 1 if autozero else 0))
+                    self.inst.write(":SENS:%s:AZER %d" % (k, 1 if autozero else 0))
                 except Exception:
                     pass
+
+        self._refresh_range()
         if verbose:
             print("      %s: 已配置 %s" % (self.name, self.summary()))
+
+    def _refresh_range(self):
+        """读回当前量程模式与量程值。"""
+        try:
+            f = self.current_func()
+            key = "VOLT" if "VOLT" in f.upper() else "CURR"
+            self.range_auto = self.inst.query(":SENS:%s:RANG:AUTO?" % key).strip()
+            self.range_now = self.inst.query(":SENS:%s:RANG?" % key).strip()
+        except Exception:
+            self.range_auto = "?"
+            self.range_now = "?"
+
+    def warmup(self, n=3, verbose=True):
+        """连续读 n 次，让**自动量程稳定下来**。
+
+        为什么要预热：自动量程在第一次测量时可能需要切换档位（耗时更长），
+        预热后量程就稳定了，正式采集时每轮读数都在正常耗时内。
+        返回 (读数列表, 每次耗时毫秒列表)。
+        """
+        vals, costs = [], []
+        for _ in range(max(0, int(n))):
+            t0 = time.perf_counter()
+            try:
+                vals.append(self.read())
+            except DMMError:
+                vals.append(None)
+            costs.append((time.perf_counter() - t0) * 1000.0)
+        self._refresh_range()
+        if verbose and vals:
+            ok = [v for v in vals if v is not None]
+            print("      %s: 预热 %d 次，量程=%s(%s)，单次 %.0f~%.0f ms"
+                  % (self.name, len(vals),
+                     self.range_now, self.range_mode_cn(),
+                     min(costs), max(costs)))
+        return vals, costs
+
+    def range_mode_cn(self):
+        """量程模式的中文描述。"""
+        return "自动" if self.range_auto.strip() in ("1", "+1", "ON") else "固定"
 
     def current_func(self):
         try:
@@ -302,14 +354,8 @@ class DMM:
 
     def summary(self):
         f = self.current_func()
-        try:
-            if "VOLT" in f:
-                r = self.inst.query(":SENS:VOLT:RANG?").strip()
-            else:
-                r = self.inst.query(":SENS:CURR:RANG?").strip()
-        except Exception:
-            r = "?"
-        return "func=%s range=%s" % (f, r)
+        self._refresh_range()
+        return "func=%s 量程=%s(%s)" % (f, self.range_now, self.range_mode_cn())
 
     # ---- 读数 ----
     def read(self):

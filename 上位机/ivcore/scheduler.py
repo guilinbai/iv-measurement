@@ -131,9 +131,9 @@ class Acquisition:
         """
         ok, iv = self.cfg.interval_ok(self.interval)
         if not ok:
-            self.log("      [!] 采样间隔 %.2f s 小于一轮耗时 %.2f s，"
-                     "实际周期会被拉长（建议 >= %.2f s）"
-                     % (self.interval, self.cfg.round_cost_s(),
+            self.log("      [!] 采样间隔 %.2f s 的余量只有 %.2f s（低于一轮耗时的 20%%），"
+                     "偶发抖动可能追不上；建议 >= %.2f s"
+                     % (self.interval, self.interval - self.cfg.round_cost_s(),
                         self.cfg.min_interval_s()))
             self.storage.event("WARN", "acq",
                                "interval %.2f below round cost %.2f"
