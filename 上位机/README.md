@@ -74,6 +74,7 @@ pip install PySide6
 | `main.py` | 采集主程序（命令行版：调度 + 双表读数 + 落盘） | ✅ 已实测跑通 |
 | **`main_gui.py`** | **★ 图形界面**（双图 + 控制面板 + 实时状态） | ✅ **第 2 期** |
 | `inspect_db.py` | 数据查看与筛选导出（`--runs` 看运行记录） | ✅ 可用 |
+| `setup_github.py` | **一键配置 GitHub 备份**（配远程 + 测连通 + 推送） | ✅ 见 `17-备份到GitHub.md` |
 | `ui/main_window.py` | 主窗口：控制区、状态栏、日志、间隔保护 | ✅ |
 | `ui/plots.py` | 双图组件：X 轴联动、时间轴、降采样 | ✅ |
 | `ui/buffer.py` | 内存环形缓冲 + 降采样 + 跨天历史查询 | ✅ |
