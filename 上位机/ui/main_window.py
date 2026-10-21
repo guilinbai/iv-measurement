@@ -63,6 +63,8 @@ class MainWindow(QWidget):
         self._hist_info = ""
         # True = 刚启动/数据不足时自动贴合数据起点；用户一旦明确选跨度就关掉
         self._auto_fit = True
+        # 上次由程序设置的 X 范围；用来检测"用户是否手动缩放/平移过"
+        self._last_set_xr = None
 
         self.setWindowTitle("4 路 IV 测量 · 实时监视  (v0.3 · 含温度)")
         self.resize(1280, 900)
@@ -493,15 +495,50 @@ class MainWindow(QWidget):
         self.span_s = hours * 3600.0
         self._apply_span("自定义 %.2f 小时" % hours)
 
+    def _set_x(self, t0, t1):
+        """由程序设置 X 范围，并记住它（供 _detect_user_zoom 对比）。"""
+        self.plots.set_x_range(t0, t1)
+        self._last_set_xr = (t0, t1)
+
+    def _detect_user_zoom(self):
+        """检测用户是否手动缩放/平移过 X 轴。
+
+        不依赖 pyqtgraph 的 sigRangeChangedManually（滚轮时不可靠），
+        而是把"当前实际范围"与"上次程序设置的范围"对比：
+        只要明显不同，就认定用户动过手 → 永久停止自动跟随。
+        """
+        if not self.follow or self._last_set_xr is None:
+            return False
+        try:
+            cur = self.plots.x_range()
+        except Exception:
+            return False
+        tol = max(1.0, abs(self.span_s) * 0.005)   # 0.5% 或 1 秒
+        if (abs(cur[0] - self._last_set_xr[0]) > tol
+                or abs(cur[1] - self._last_set_xr[1]) > tol):
+            self.follow = False
+            if hasattr(self, "chk_follow"):
+                self.chk_follow.setChecked(False)
+            span = cur[1] - cur[0]
+            if span > 1:
+                # 顺便把"视图跨度"调成用户缩放后的实际宽度，
+                # 这样后续刷新取数据也按这个宽度来，不会画出奇怪的内容
+                self.span_s = span
+            self._append_log("检测到手动缩放/平移 → 已停止自动跟随"
+                             "（想恢复请点『跟随最新』或重新选视图跨度）")
+            return True
+        return False
+
     def _apply_span(self, label):
         """立刻应用新的视图跨度：重新跟随 + 立即设置 X 轴范围 + 强制刷新。"""
         self.follow = True
         self._auto_fit = False              # ★ 用户明确选了跨度，就严格按它显示
+        self._last_set_xr = None            # 重置对比基线，避免误判
         if hasattr(self, "chk_follow"):
             self.chk_follow.setChecked(True)
         self._hist_query_t = 0.0            # 历史视图下次刷新必须重查
         now = time.time()
-        self.plots.set_x_range(now - self.span_s, now)   # ★ 立即改横坐标
+        self._set_x(now - self.span_s, now)   # ★ 立即改横坐标
         self._append_log("视图跨度 → %s（%.2f 小时）" % (label, self.span_s / 3600.0))
         self._refresh()
 
@@ -523,6 +560,8 @@ class MainWindow(QWidget):
     # ==================================================================
     def _refresh(self):
         now = time.time()
+        # ★ 先看用户是不是手动缩放/平移过（滚轮也算）；是就不再自动改范围
+        self._detect_user_zoom()
         # ≤2 小时用内存缓冲（有实时数据）；更长的跨度去数据库查（原始/聚合表）
         realtime = self.span_s <= 7200 and (self.follow or self.worker is None)
 
@@ -551,7 +590,7 @@ class MainWindow(QWidget):
                 data[(ch, "T")] = self.buf.arrays(ch, "T", t0, t1)
             self.plots.update_data(data)
             if self.follow:
-                self.plots.set_x_range(t0, t1)
+                self._set_x(t0, t1)
             self._hist_info = "内存缓冲（实时）"
         else:
             # 历史视图：从数据库查（每 10 秒最多查一次，避免频繁 IO）
@@ -565,7 +604,7 @@ class MainWindow(QWidget):
                 self.plots.update_data(data)
                 self._hist_info = "数据库 %s（跨天合并）" % table
                 if self.follow:
-                    self.plots.set_x_range(t0, t1)
+                    self._set_x(t0, t1)
 
         self.plots.set_y_auto()
         self._update_status(now)

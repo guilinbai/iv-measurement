@@ -202,28 +202,43 @@ class PowerSupply:
         data = buf[3:3 + bc]
         if len(data) < 16:
             return False
-        regs = [(data[i] | (data[i + 1] << 8)) for i in range(0, 16, 2)]
-        stat0, stat1 = regs[0], regs[1]
+
+        # ★★★ 端序陷阱（协议 1.3 明确写的）★★★
+        #   状态寄存器0 / 状态寄存器1 —— **固定"高字节先"**，
+        #     不受"串口数据大小端设定"影响
+        #   电压 / 电流 / 最大电压电流 —— 按大小端设定（本机为**小端：低字节先**）
+        #   写控制寄存器时同样必须"高字节先"，否则 bit8(OUTCTRL) 永远写不进去，
+        #   表现就是"点了输出开、PS 位不变、实测电压恒为 0"。
+        stat0 = (data[0] << 8) | data[1]
+        stat1 = (data[2] << 8) | data[3]
+
+        le = lambda i: data[i] | (data[i + 1] << 8)     # 小端
+        volt_raw, curr_raw = le(4), le(6)
+        vset_raw, iset_raw = le(8), le(10)
+        vmax_raw, imax_raw = le(12), le(14)
+
         vpod = (stat0 >> 4) & 1
         ipod = (stat1 >> 4) & 1
         vscale = 100.0 if vpod == 0 else 10.0
         iscale = 1000.0 if ipod == 0 else 100.0
 
         self.info = {
-            "raw": regs,
+            "raw": [stat0, stat1, volt_raw, curr_raw,
+                    vset_raw, iset_raw, vmax_raw, imax_raw],
             "stat0": stat0, "stat1": stat1,
             "v_scale": vscale, "i_scale": iscale,
             "out_on": bool((stat0 >> 8) & 1),
             "ocp": bool((stat0 >> 9) & 1),
             "lock": bool((stat0 >> 10) & 1),
+            "big_endian": bool((stat0 >> 11) & 1),
             "cv": not bool((stat0 >> 12) & 1),
             "alarm": bool((stat0 >> 13) & 1),
-            "volt": regs[2] / vscale,
-            "curr": regs[3] / iscale,
-            "vset": regs[4] / vscale,
-            "iset": regs[5] / iscale,
-            "vmax": regs[6] / vscale,
-            "imax": regs[7] / iscale,
+            "volt": volt_raw / vscale,
+            "curr": curr_raw / iscale,
+            "vset": vset_raw / vscale,
+            "iset": iset_raw / iscale,
+            "vmax": vmax_raw / vscale,
+            "imax": imax_raw / iscale,
         }
         self.set_v = self.info["vset"]
         self.set_a = self.info["iset"]
@@ -263,7 +278,12 @@ class PowerSupply:
 
         实测：写单个寄存器（count=1）设备**完全不回应也不生效**；
               一次写 3 个（0x0000 控制 / 0x0001 电压 / 0x0002 电流）立即成功。
-        数据段为小端（低字节在前）。
+
+        ★★★ 端序（协议 1.3）★★★
+          控制寄存器 = 状态寄存器一类的"位寄存器" → **高字节先**
+          电压/电流  = 数据寄存器 → 按大小端设定（本机**小端：低字节先**）
+          写反了的典型症状：bit8(OUTCTRL) 写不进去，PS 位永远是 0，
+          表现为"点了输出开、电源就是不输出"。
         """
         if self.protocol == "none":
             return True
@@ -271,9 +291,9 @@ class PowerSupply:
             raise PowerSupplyError("%s: 串口未打开" % self.name)
 
         body = [self.addr, 0x10, 0x00, 0x00, 0x00, 0x03, 0x06,
-                ctrl & 0xFF, (ctrl >> 8) & 0xFF,
-                int(v_raw) & 0xFF, (int(v_raw) >> 8) & 0xFF,
-                int(i_raw) & 0xFF, (int(i_raw) >> 8) & 0xFF]
+                (ctrl >> 8) & 0xFF, ctrl & 0xFF,              # 控制字：高字节先
+                int(v_raw) & 0xFF, (int(v_raw) >> 8) & 0xFF,   # 电压：小端
+                int(i_raw) & 0xFF, (int(i_raw) >> 8) & 0xFF]   # 电流：小端
         frame = _with_crc(body)
         try:
             self.ser.reset_input_buffer()
@@ -349,14 +369,10 @@ class PowerSupply:
         return a
 
     def output(self, on):
-        """开/关输出。
+        """开/关输出（写控制寄存器 bit8，高字节先）。
 
-        本机实测：控制寄存器 OUTCTRL 位与写线圈**设备都不响应**（PS 恒为 1，
-        且设定电压 > 0 时**实测电压仍为 0**），说明这台电源的输出使能不在串口
-        控制范围内（很可能要按面板的 OUTPUT 键）。所以这里会：
-          · 写控制字（尽力而为）
-          · **回读校验**（PS 位 + 实测电压）
-          · 没真正生效就抛异常，绝不让界面显示假的"成功"
+        校验只信 **PS 位**（状态寄存器0 的 bit8）—— 不能用实测电压判断，
+        因为电源在**恒流(CC)模式**下实测电压会明显低于设定值，那属于正常现象。
         """
         on = bool(on)
         if self.protocol == "none":
@@ -370,31 +386,36 @@ class PowerSupply:
         v_raw = int(round((self.set_v if self.set_v is not None else 0.0) * vs))
         i_raw = int(round((self.set_a if self.set_a is not None else 1.0) * is_))
 
-        if not self._write3(self._ctrl_word(out_on=on), v_raw, i_raw):
-            raise PowerSupplyError("%s: 输出开关命令无响应" % self.name)
+        ok = False
+        for attempt in range(3):                # 设备偶发不响应，重试几次
+            if not self._write3(self._ctrl_word(out_on=on), v_raw, i_raw):
+                time.sleep(0.15)
+                continue
+            time.sleep(0.35)
+            self.read_status()
+            if bool(self.info.get("out_on")) == on:
+                ok = True
+                break
+            time.sleep(0.2)
 
-        time.sleep(0.4)
-        self.read_status()
-        ps = bool(self.info.get("out_on"))
-        volt = float(self.info.get("volt") or 0.0)
-        vset = float(self.info.get("vset") or 0.0)
-        self.out_on = ps
+        if not ok:
+            raise PowerSupplyError(
+                "%s: 设备没有响应『输出%s』（连试 3 次，PS 位仍为 %d）。"
+                "请检查电源面板是否处于本地模式，或按一下面板 OUTPUT 键"
+                % (self.name, "开" if on else "关",
+                   bool(self.info.get("out_on"))))
 
+        self.out_on = on
+        # 仅作提示：输出开了但既没电压也没电流 → 可能没接负载
         if on:
-            # 真要"输出"，必须看到实测电压跟上（设定>1V 时）
-            if vset > 1.0 and volt < vset * 0.5:
+            v = float(self.info.get("volt") or 0)
+            a = float(self.info.get("curr") or 0)
+            if v < 0.2 and a < 0.001:
                 raise PowerSupplyError(
-                    "%s: 已经写了输出开（状态显示 PS=%d），但**实测电压仍为 %.2f V**"
-                    "（设定 %.2f V）。说明这台电源的输出使能不受串口控制——"
-                    "请在**电源面板上按 OUTPUT 键**让输出真正接通。"
-                    % (self.name, ps, volt, vset))
-            return True
-        else:
-            if ps:
-                raise PowerSupplyError(
-                    "%s: 设备没有响应'关输出'（PS 仍为 1）。"
-                    "可改用『把电压设为 0 V』停止驱动" % self.name)
-            return False
+                    "%s: 输出已开启（PS=1），但实测 %.2f V / %.3f A，"
+                    "负载端似乎没接通（空载或加热器未连接）"
+                    % (self.name, v, a))
+        return on
 
 
 # ============================================================================
