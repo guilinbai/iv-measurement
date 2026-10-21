@@ -102,6 +102,17 @@ class Storage:
         n_bad    INTEGER
     );
 
+    -- 环境数据（温度/湿度），独立节奏（如每 5 秒一次），与测量共用时间轴
+    CREATE TABLE IF NOT EXISTS env (
+        ts      REAL,
+        run_id  INTEGER,
+        sensor  TEXT,
+        ch      INTEGER,
+        value   REAL,
+        unit    TEXT,
+        quality INTEGER DEFAULT 0
+    );
+
     CREATE TABLE IF NOT EXISTS agg_1min (
         bucket INTEGER, ch INTEGER, mode TEXT,
         v_min REAL, v_max REAL, v_avg REAL, n INTEGER,
@@ -120,12 +131,14 @@ class Storage:
     CREATE INDEX IF NOT EXISTS idx_samples_ts      ON samples(ts);
     CREATE INDEX IF NOT EXISTS idx_samples_grid    ON samples(grid_ts);
     CREATE INDEX IF NOT EXISTS idx_samples_ch_mode ON samples(ch, mode, ts);
+    CREATE INDEX IF NOT EXISTS idx_env_ts          ON env(ts);
     """
 
-    def __init__(self, root, write_csv=True, nch=4, verbose=True):
+    def __init__(self, root, write_csv=True, nch=4, env_channels=None, verbose=True):
         self.root = os.path.abspath(root)
         self.write_csv = write_csv
         self.nch = int(nch)
+        self.env_channels = list(env_channels or [])
         self.verbose = verbose
 
         # 宽表列：iso_time, round_id, v1, i1, v2, i2, ...
@@ -133,17 +146,28 @@ class Storage:
         for ch in range(1, self.nch + 1):
             self.csv_cols += ["v%d" % ch, "i%d" % ch]
 
+
         self.con = None
         self.db = None
         self.csv_file = None
         self.csv_writer = None
+        self.env_file = None
+        self.env_writer = None
         self.day = None
 
         self.run_id = None
         self.round_id = 0
         self.n_written = 0
         self.n_csv = 0
+        self.n_env = 0
         self._pending_agg = {}
+
+        # 环境数据宽表列：iso_time, t1, t2, ..., dt（温差）
+        self.env_cols = ["iso_time"]
+        for ch in self.env_channels:
+            self.env_cols.append("t%d" % ch)
+        if len(self.env_channels) >= 2:
+            self.env_cols.append("dt")
 
         os.makedirs(self.root, exist_ok=True)
         self._rollover(force=True)
@@ -192,9 +216,20 @@ class Storage:
                 self.csv_file.flush()
             self.n_csv = self._count_csv_rows(csv_path)
 
+            # 环境数据单独一个 CSV（一行一次采样）
+            if self.env_channels:
+                env_path = os.path.join(d, "%s_env.csv" % day)
+                new_env = (not os.path.exists(env_path)) or os.path.getsize(env_path) == 0
+                self.env_file = open(env_path, "a", newline="", encoding="utf-8")
+                self.env_writer = csv.writer(self.env_file)
+                if new_env:
+                    self.env_writer.writerow(self.env_cols)
+                    self.env_file.flush()
+
         if self.verbose:
-            print("      存储: %s  (宽表 %d 列, 已有轮号到 %d)"
-                  % (db_path, len(self.csv_cols), self.round_id))
+            print("      存储: %s  (宽表 %d 列, 已有轮号到 %d%s)"
+                  % (db_path, len(self.csv_cols), self.round_id,
+                     "，环境 CSV %d 列" % len(self.env_cols) if self.env_channels else ""))
         return True
 
     def _migrate(self):
@@ -220,14 +255,17 @@ class Storage:
             except Exception:
                 pass
             self.con = None
-        if self.csv_file:
-            try:
-                self.csv_file.flush()
-                self.csv_file.close()
-            except Exception:
-                pass
-            self.csv_file = None
-            self.csv_writer = None
+        for attr in ("csv_file", "env_file"):
+            f = getattr(self, attr, None)
+            if f:
+                try:
+                    f.flush()
+                    f.close()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        self.csv_writer = None
+        self.env_writer = None
 
     @staticmethod
     def _count_csv_rows(path):
@@ -334,6 +372,55 @@ class Storage:
         self._flush_agg()
 
         return len(rows)
+
+    # ------------------------------------------------------------------
+    #  写环境数据（温度/湿度，独立节奏）
+    # ------------------------------------------------------------------
+    def write_env(self, values, ts=None, sensor="TA612"):
+        """写一次环境采样。
+
+        values : {通道: 温度℃ 或 None}，如 {1: 26.7, 2: 26.7}
+        ts     : PC 时间戳（设备帧里没有时间戳，统一用 PC 时间，保证与测量共轴）
+        返回写入的行数（有效值的个数）。
+        """
+        ts = ts or time.time()
+        self._rollover(ts=ts)
+
+        rows = [(ts, self.run_id, sensor, ch, val, "C", 0)
+                for ch, val in sorted(values.items()) if val is not None]
+        if rows:
+            self.con.executemany(
+                "INSERT INTO env (ts, run_id, sensor, ch, value, unit, quality)"
+                " VALUES (?,?,?,?,?,?,?)", rows)
+            self.con.commit()
+            self.n_env += len(rows)
+
+        # ---- CSV 宽表（一行一次采样）----
+        if self.env_writer and self.env_channels:
+            row = [_iso_sec(ts)]
+            for ch in self.env_channels:
+                v = values.get(ch)
+                row.append("" if v is None else "%.2f" % v)
+            if len(self.env_channels) >= 2:
+                a, b = values.get(self.env_channels[0]), values.get(self.env_channels[1])
+                row.append("" if (a is None or b is None) else "%.2f" % (a - b))
+            self.env_writer.writerow(row)
+            self.env_file.flush()
+
+        return len(rows)
+
+    def query_env(self, t0=None, t1=None, chs=None):
+        """返回 [(ts, ch, value), ...]"""
+        sql = "SELECT ts, ch, value FROM env WHERE 1=1"
+        args = []
+        if t0 is not None:
+            sql += " AND ts>=?"; args.append(t0)
+        if t1 is not None:
+            sql += " AND ts<=?"; args.append(t1)
+        if chs:
+            sql += " AND ch IN (%s)" % ",".join("?" * len(chs)); args += list(chs)
+        sql += " ORDER BY ts"
+        return self.con.execute(sql, args).fetchall()
 
     def _agg_add(self, ts, ch, mode, val):
         for name, width in (("agg_1min", 60), ("agg_1hour", 3600)):

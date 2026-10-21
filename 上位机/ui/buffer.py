@@ -63,16 +63,23 @@ def downsample_minmax(ts, vals, buckets=1600):
 #  内存环形缓冲
 # ============================================================================
 class TrendBuffer:
-    """按 (ch, mode) 存最近的数据点，定长。"""
+    """按 (ch, mode) 存最近的数据点，定长。
 
-    def __init__(self, nch=4, maxlen=60000):
+    mode: "V" 电压 / "I" 电流 / "T" 温度（环境量，独立节奏）
+    """
+
+    def __init__(self, nch=4, maxlen=60000, env_channels=None):
         self.nch = nch
         self.maxlen = maxlen
+        self.env_channels = list(env_channels or [])
         self.data = {}
         for ch in range(1, nch + 1):
             for mode in ("V", "I"):
                 self.data[(ch, mode)] = deque(maxlen=maxlen)
+        for ch in self.env_channels:
+            self.data[(ch, "T")] = deque(maxlen=maxlen)
         self.n_total = 0
+        self.env_latest = {}
 
     def add(self, ts, ch, mode, val):
         key = (ch, mode)
@@ -86,10 +93,18 @@ class TrendBuffer:
             if len(s) >= 4:
                 self.add(s[0], s[1], s[2], s[3])
 
+    def add_env(self, ts, values):
+        """环境量：values = {通道: 温度}"""
+        for ch, val in values.items():
+            self.add(ts, ch, "T", val)
+            if val is not None:
+                self.env_latest[ch] = val
+
     def clear(self):
         for k in self.data:
             self.data[k].clear()
         self.n_total = 0
+        self.env_latest = {}
 
     def arrays(self, ch, mode, t0=None, t1=None):
         """取出 [t0, t1] 范围内的 (ts, vals) 数组。"""
@@ -171,6 +186,33 @@ def query_history(root, t0, t1, nch=4):
     for k, (ts, vals) in out.items():
         res[k] = (np.asarray(ts, dtype=float), np.asarray(vals, dtype=float))
     return res, (table, is_agg)
+
+
+def query_history_env(root, t0, t1, channels):
+    """跨天查询环境数据（温度）。
+
+    返回 {ch: (ts_array, val_array)}
+    """
+    chs = list(channels or [])
+    out = {ch: ([], []) for ch in chs}
+    if not chs:
+        return out
+
+    for db in list_databases(root):
+        try:
+            con = sqlite3.connect(db)
+            sql = ("SELECT ts, ch, value FROM env"
+                   " WHERE ts>=? AND ts<=? AND value IS NOT NULL ORDER BY ts")
+            for ts, ch, val in con.execute(sql, (t0, t1)):
+                if ch in out:
+                    out[ch][0].append(ts)
+                    out[ch][1].append(val)
+            con.close()
+        except Exception:
+            continue
+
+    return {ch: (np.asarray(a, dtype=float), np.asarray(b, dtype=float))
+            for ch, (a, b) in out.items()}
 
 
 def query_count(root, t0, t1):

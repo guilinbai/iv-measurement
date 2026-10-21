@@ -58,6 +58,28 @@ class Config:
         dev["arduino"].setdefault("timeout_s", 1.0)
         dev["arduino"].setdefault("heartbeat_s", 5)
 
+        # ---- 温度采集器（TA612）----
+        ta = dev.setdefault("tasensor", {})
+        ta.setdefault("enabled", True)
+        ta.setdefault("port", "COM4")
+        ta.setdefault("baud", 9600)
+        ta.setdefault("timeout_s", 1.0)
+        ta.setdefault("interval_s", 5.0)
+        ta.setdefault("channels", [1, 2])
+        ta.setdefault("invalid_above", 100.0)
+
+        # ---- 直流电压源（Wanptek MODBUS-RTU）----
+        ps = dev.setdefault("powersupply", {})
+        ps.setdefault("enabled", True)
+        ps.setdefault("port", "COM13")
+        ps.setdefault("baud", 2400)
+        ps.setdefault("addr", 0)
+        ps.setdefault("protocol", "modbus")
+        ps.setdefault("settle_s", 2.0)
+        ps.setdefault("max_voltage", 31.0)
+        ps.setdefault("timeout_s", 0.5)
+        ps.setdefault("off_on_exit", False)
+
         tm = self.raw.setdefault("timing", {})
         tm.setdefault("t_open_ms", 30)
         tm.setdefault("t_settle_ms", 80)
@@ -118,6 +140,17 @@ class Config:
             "  电压表      : %s" % dv["dmm_voltage"].get("resource", "(未配置)"),
             "  电流表      : %s" % dv["dmm_current"].get("resource", "(未配置)"),
             "  Arduino     : %s" % (dv["arduino"].get("port") or "(自动探测)"),
+            "  温度采集器  : %s"
+            % ("%s @ %s，每 %.0f s 采一次，通道 %s"
+               % ("TA 系列", dv["tasensor"]["port"], dv["tasensor"]["interval_s"],
+                  dv["tasensor"]["channels"])
+               if dv["tasensor"]["enabled"] else "未启用"),
+            "  电压源      : %s"
+            % ("%s @ %d bps 地址%d，协议 %s，上限 %.1f V"
+               % (dv["powersupply"]["port"], dv["powersupply"]["baud"],
+                  dv["powersupply"]["addr"], dv["powersupply"]["protocol"],
+                  dv["powersupply"]["max_voltage"])
+               if dv["powersupply"]["enabled"] else "未启用"),
         ]
         return "\n".join(lines)
 
@@ -135,4 +168,7 @@ if __name__ == "__main__":
     cfg = Config(os.path.join(os.path.dirname(here), "config.yaml"))
     print(cfg.dump_summary())
     ok, iv = cfg.interval_ok()
-    print("\n  间隔检查    : %s" % ("[OK] 可行" if ok else "[!] 间隔过小，一轮跑不完"))
+    print("\n  间隔检查    : %s"
+          % ("[OK] 可行" if ok
+             else "[!] 余量不足 20%%（间隔 %.2f s / 一轮 %.2f s）"
+                  % (iv, cfg.round_cost_s())))

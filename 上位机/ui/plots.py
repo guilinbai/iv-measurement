@@ -20,6 +20,10 @@ from .buffer import downsample_minmax
 CH_COLORS = {1: (31, 119, 180), 2: (255, 127, 14),
              3: (44, 160, 44), 4: (214, 39, 40)}
 
+# 温度通道配色：ch1 红（热端）、ch2 蓝（冷端），红蓝最直观
+T_COLORS = {1: (214, 39, 40), 2: (31, 119, 180),
+            3: (44, 160, 44), 4: (140, 86, 75)}
+
 pg.setConfigOptions(antialias=False)      # 大数据量时关抗锯齿，快很多
 pg.setConfigOption("background", "w")
 pg.setConfigOption("foreground", "k")
@@ -28,10 +32,11 @@ pg.setConfigOption("foreground", "k")
 class TrendPlots(QWidget):
     sig_user_range_changed = Signal()      # 用户手动缩放/平移了
 
-    def __init__(self, nch=4, buckets=1600, parent=None):
+    def __init__(self, nch=4, buckets=1600, env_channels=None, parent=None):
         super().__init__(parent)
         self.nch = nch
         self.buckets = buckets
+        self.env_channels = list(env_channels or [])
         self._setting_range = False
 
         lay = QVBoxLayout(self)
@@ -44,18 +49,32 @@ class TrendPlots(QWidget):
         self.p_v.showGrid(x=True, y=True, alpha=0.25)
         self.p_v.addLegend(offset=(8, 8), labelTextSize="9pt")
         self.p_v.getAxis("bottom").setStyle(showValues=False)   # 上图不重复显示时间
-        self.p_v.setMinimumHeight(150)
+        self.p_v.setMinimumHeight(140)
 
         # ---------------- 电流图 ----------------
         self.p_i = pg.PlotWidget(axisItems={"bottom": pg.DateAxisItem()})
         self.p_i.setLabel("left", "Isc（电流）")
-        self.p_i.setLabel("bottom", "时间")
         self.p_i.showGrid(x=True, y=True, alpha=0.25)
         self.p_i.addLegend(offset=(8, 8), labelTextSize="9pt")
-        self.p_i.setMinimumHeight(150)
+        self.p_i.setMinimumHeight(140)
+        self.p_i.getAxis("bottom").setStyle(showValues=not self.env_channels)
 
-        # ★ X 轴联动：两个图共享同一时间轴
+        # ---------------- 温度图（仅当启用了温度采集）----------------
+        self.p_t = None
+        if self.env_channels:
+            self.p_t = pg.PlotWidget(axisItems={"bottom": pg.DateAxisItem()})
+            self.p_t.setLabel("left", "温度（℃）")
+            self.p_t.setLabel("bottom", "时间")
+            self.p_t.showGrid(x=True, y=True, alpha=0.25)
+            self.p_t.addLegend(offset=(8, 8), labelTextSize="9pt")
+            self.p_t.setMinimumHeight(120)
+        else:
+            self.p_i.setLabel("bottom", "时间")
+
+        # ★ X 轴联动：三个图共享同一时间轴（缩放/平移任一个，其余同步）
         self.p_i.setXLink(self.p_v)
+        if self.p_t is not None:
+            self.p_t.setXLink(self.p_v)
 
         # ---------------- 曲线 ----------------
         self.curves = {}          # (ch, mode) -> PlotDataItem
@@ -67,9 +86,16 @@ class TrendPlots(QWidget):
                 pen=pen, name="ch%d" % ch, autoDownsample=False, clipToView=True)
             self.curves[(ch, "I")] = self.p_i.plot(
                 pen=pen, name="ch%d" % ch, autoDownsample=False, clipToView=True)
+        for ch in self.env_channels:
+            r, g, b = T_COLORS.get(ch, (100, 100, 100))
+            self.curves[(ch, "T")] = self.p_t.plot(
+                pen=pg.mkPen((r, g, b), width=1.8), name="T%d" % ch,
+                autoDownsample=False, clipToView=True)
 
-        lay.addWidget(self.p_v, 1)
-        lay.addWidget(self.p_i, 1)
+        lay.addWidget(self.p_v, 3)
+        lay.addWidget(self.p_i, 3)
+        if self.p_t is not None:
+            lay.addWidget(self.p_t, 2)
 
         # 记录"最后画过的数据"，用于只改变通道显隐时快速重画
         self._last = {}
@@ -85,7 +111,7 @@ class TrendPlots(QWidget):
     # ------------------------------------------------------------------
     def set_channel_visible(self, ch, visible):
         self.enabled[ch] = bool(visible)
-        for mode in ("V", "I"):
+        for mode in ("V", "I", "T"):
             c = self.curves.get((ch, mode))
             if c is not None:
                 c.setVisible(self.enabled[ch])
@@ -140,6 +166,10 @@ class TrendPlots(QWidget):
             self.p_v.enableAutoRange(axis="y")
         if mode in (None, "I"):
             self.p_i.enableAutoRange(axis="y")
+        if mode in (None, "T") and self.p_t is not None:
+            self.p_t.enableAutoRange(axis="y")
 
     def set_y_range(self, mode, lo, hi):
-        (self.p_v if mode == "V" else self.p_i).setYRange(lo, hi, padding=0)
+        w = {"V": self.p_v, "I": self.p_i, "T": self.p_t}.get(mode)
+        if w is not None:
+            w.setYRange(lo, hi, padding=0)

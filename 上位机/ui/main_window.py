@@ -16,6 +16,7 @@
 """
 
 import os
+import queue
 import shutil
 import time
 from datetime import datetime
@@ -27,9 +28,10 @@ from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QDoubleSpinBox, QFrame,
                                QPushButton, QRadioButton, QSizePolicy, QVBoxLayout,
                                QWidget)
 
-from .buffer import TrendBuffer, query_history, query_count, list_databases
+from .buffer import (TrendBuffer, query_history, query_history_env,
+                     query_count, list_databases)
 from .plots import TrendPlots
-from .worker import AcquisitionWorker, FakeWorker
+from .worker import AcquisitionWorker, FakeWorker, EnvWorker
 
 # 视图范围：名称 -> 秒
 SPANS = [("10 分钟", 600), ("1 小时", 3600), ("1 天", 86400), ("7 天", 604800)]
@@ -42,8 +44,15 @@ class MainWindow(QWidget):
         self.nch = int(cfg["acquisition"]["channels"])
         self.root = cfg["storage"]["dir"]
 
+        # 温度通道（启用温度采集时才有）
+        ta = cfg["devices"]["tasensor"]
+        self.env_chs = list(ta["channels"]) if ta.get("enabled") else []
+
         self.worker = None
-        self.buf = TrendBuffer(nch=self.nch, maxlen=60000)
+        self.env_worker = None
+        self.env_queue = queue.Queue()      # 温度数据 → 采集线程落盘
+        self.buf = TrendBuffer(nch=self.nch, maxlen=60000,
+                               env_channels=self.env_chs)
         self.span_s = 3600                 # 当前视图跨度
         self.follow = True
         self.fake_mode = False
@@ -53,8 +62,8 @@ class MainWindow(QWidget):
         self._hist_query_t = 0.0
         self._hist_info = ""
 
-        self.setWindowTitle("4 路 IV 测量 · 实时监视  (v0.2)")
-        self.resize(1280, 860)
+        self.setWindowTitle("4 路 IV 测量 · 实时监视  (v0.3 · 含温度)")
+        self.resize(1280, 900)
         self._build_ui()
 
         # 刷新定时器（限帧 3 Hz —— 人眼看曲线不需要更高）
@@ -144,10 +153,42 @@ class MainWindow(QWidget):
         self.lbl_hint.setFont(QFont("", 9))
         root.addWidget(self.lbl_hint)
 
-        # ---------------- 双图 ----------------
+        # ---------------- 电压源控制（驱动 ch1/ch2 温差）----------------
+        ps_cfg = self.cfg["devices"]["powersupply"]
+        self.ps = None
+        self._ps_last_read = 0.0
+        if ps_cfg.get("enabled"):
+            bar = QHBoxLayout()
+            bar.setSpacing(8)
+            bar.addWidget(QLabel("驱动电压源："))
+            self.spin_volt = QDoubleSpinBox()
+            self.spin_volt.setRange(0.0, float(ps_cfg.get("max_voltage", 31.0)))
+            self.spin_volt.setDecimals(2)
+            self.spin_volt.setSingleStep(0.5)
+            self.spin_volt.setSuffix(" V")
+            self.spin_volt.setValue(0.0)
+            self.spin_volt.setMinimumWidth(90)
+            bar.addWidget(self.spin_volt)
+
+            self.btn_volt_apply = QPushButton("应用")
+            self.btn_volt_apply.clicked.connect(self._apply_voltage)
+            bar.addWidget(self.btn_volt_apply)
+
+            self.btn_out = QPushButton("输出：—")
+            self.btn_out.setCheckable(True)
+            self.btn_out.clicked.connect(self._toggle_output)
+            bar.addWidget(self.btn_out)
+
+            self.lbl_ps = QLabel("未连接（点开始采集时连接 %s）" % ps_cfg.get("port"))
+            self.lbl_ps.setStyleSheet("color:#666;")
+            bar.addWidget(self.lbl_ps, 1)
+            root.addLayout(bar)
+
+        # ---------------- 多图（电压 / 电流 / 温度）----------------
         self.plots = TrendPlots(nch=self.nch,
                                 buckets=int(self.cfg.get("ui", "downsample_buckets",
-                                                         default=1600)))
+                                                         default=1600)),
+                                env_channels=self.env_chs)
         self.plots.sig_user_range_changed.connect(self._on_user_range)
         root.addWidget(self.plots, 1)
 
@@ -208,6 +249,83 @@ class MainWindow(QWidget):
                 % (cost, iv, margin, min_iv))
             self.lbl_hint.setStyleSheet("color:#c0392b; font-weight:bold;")
 
+    # ------------------------------------------------------------------
+    #  电压源操作
+    # ------------------------------------------------------------------
+    def _connect_ps(self):
+        """连接电压源（在主线程，约 0.3 s）。"""
+        ps_cfg = self.cfg["devices"]["powersupply"]
+        if not ps_cfg.get("enabled") or self.ps is not None:
+            return
+        from ivcore.powersupply import PowerSupply, PowerSupplyError
+        try:
+            ps = PowerSupply(port=ps_cfg["port"], baud=ps_cfg["baud"],
+                             addr=ps_cfg.get("addr", 0),
+                             protocol=ps_cfg.get("protocol", "modbus"),
+                             settle_s=ps_cfg.get("settle_s", 2.0),
+                             max_voltage=ps_cfg.get("max_voltage"),
+                             off_on_exit=ps_cfg.get("off_on_exit", False))
+            msg = ps.open(verbose=False)
+            self.ps = ps
+            self.spin_volt.setValue(ps.info.get("vset") or 0.0)
+            self._append_log("电压源已连接: %s" % msg)
+            self._refresh_ps_label()
+        except PowerSupplyError as e:
+            self._append_log("[!] 电压源连接失败: %s" % e)
+            self.lbl_ps.setText("连接失败：%s" % str(e)[:60])
+            self.lbl_ps.setStyleSheet("color:#c0392b;")
+
+    def _refresh_ps_label(self):
+        if not self.ps:
+            return
+        try:
+            self.ps.read_status()
+        except Exception as e:
+            self.lbl_ps.setText("读取状态失败: %s" % str(e)[:50])
+            self.lbl_ps.setStyleSheet("color:#c0392b;")
+            return
+        i = self.ps.info
+        self.btn_out.setText("输出：%s" % ("开" if i["out_on"] else "关"))
+        self.btn_out.setChecked(bool(i["out_on"]))
+        self.lbl_ps.setText(
+            "实测 %.3f V / %.3f A   设定 %.2f V / %.3f A   %s%s"
+            % (i["volt"], i["curr"], i["vset"], i["iset"],
+               "恒压" if i["cv"] else "恒流",
+               "  ⚠报警" if i["alarm"] else ""))
+        color = "#c0392b" if i["alarm"] else "#1a7f37" if i["out_on"] else "#666"
+        self.lbl_ps.setStyleSheet("color:%s;" % color)
+
+    def _apply_voltage(self):
+        if not self.ps:
+            self._connect_ps()
+        if not self.ps:
+            return
+        from PySide6.QtWidgets import QApplication
+        v = self.spin_volt.value()
+        self.lbl_ps.setText("正在设置 %.2f V（等稳定 %.1f s）…"
+                            % (v, self.ps.settle_s))
+        self.lbl_ps.setStyleSheet("color:#8a6100;")
+        QApplication.processEvents()
+        try:
+            self.ps.set_voltage(v)
+            self._append_log("电压源设为 %.2f V" % v)
+        except Exception as e:
+            self._append_log("[!] 设置电压失败: %s" % e)
+        self._refresh_ps_label()
+
+    def _toggle_output(self):
+        if not self.ps:
+            self._connect_ps()
+        if not self.ps:
+            return
+        want = not bool(self.ps.out_on)
+        try:
+            self.ps.output(want)
+            self._append_log("电压源输出 → %s" % ("开" if want else "关"))
+        except Exception as e:
+            self._append_log("[!] 输出开关失败: %s" % e)
+        self._refresh_ps_label()
+
     # ==================================================================
     #  开始 / 停止
     # ==================================================================
@@ -221,15 +339,22 @@ class MainWindow(QWidget):
         # 把界面上的间隔写回配置（存储快照与预估都用它）
         self.cfg.raw["acquisition"]["interval_s"] = iv
 
+        # 电压源（真实模式下才连）
+        if not self.fake_mode:
+            self._connect_ps()
+
         self.buf.clear()
         self.plots.clear()
         self.n_rounds = 0
         self.t_start = time.time()
 
         if self.fake_mode:
-            self.worker = FakeWorker(self.cfg, interval=0.2, nch=self.nch)
+            self.worker = FakeWorker(self.cfg, interval=0.2, nch=self.nch,
+                                     env_channels=self.env_chs)
+            self.worker.sig_env.connect(self._on_env)     # 假温度也走同一条链路
         else:
-            self.worker = AcquisitionWorker(self.cfg, interval=iv)
+            self.worker = AcquisitionWorker(self.cfg, interval=iv,
+                                            env_queue=self.env_queue)
 
         self.worker.sig_state_msg.connect(self._on_state)
         self.worker.sig_log.connect(self._append_log)
@@ -238,18 +363,35 @@ class MainWindow(QWidget):
         self.worker.sig_failed.connect(self._on_failed)
         self.worker.start()
 
+        # ——— 温度采集（独立线程，节奏由 config 的 tasensor.interval_s 决定）———
+        if self.env_chs and not self.fake_mode:
+            self.env_worker = EnvWorker(self.cfg)
+            self.env_worker.sig_env.connect(self._on_env)
+            self.env_worker.sig_log.connect(self._append_log)
+            self.env_worker.sig_error.connect(lambda m: self._append_log("[!] " + m))
+            self.env_worker.start()
+
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.chk_fake.setEnabled(False)
         self.spin_interval.setEnabled(False)
-        self._append_log("——— 开始采集（间隔 %.2f s，%s）———"
-                         % (iv, "模拟模式" if self.fake_mode else "真实硬件"))
+        self._append_log("——— 开始采集（间隔 %.2f s，%s%s）———"
+                         % (iv, "模拟模式" if self.fake_mode else "真实硬件",
+                            "，温度采集已启动" if self.env_worker else ""))
 
     def _stop(self):
+        if self.env_worker and self.env_worker.isRunning():
+            self.env_worker.stop()
         if self.worker and self.worker.isRunning():
             self.btn_stop.setEnabled(False)
             self._append_log("正在停止（等当前轮结束并收尾）…")
             self.worker.stop()
+
+    # ------------------------------------------------------------------
+    def _on_env(self, ts, vals):
+        """收到一次温度采样（界面线程）。"""
+        self.buf.add_env(ts, vals)
+        self.env_queue.put((ts, vals))      # 交给采集线程落盘
 
     # ==================================================================
     #  采集线程回调（全部在界面线程执行）
@@ -329,6 +471,8 @@ class MainWindow(QWidget):
             for ch in range(1, self.nch + 1):
                 for mode in ("V", "I"):
                     data[(ch, mode)] = self.buf.arrays(ch, mode, t0, t1)
+            for ch in self.env_chs:
+                data[(ch, "T")] = self.buf.arrays(ch, "T", t0, t1)
             self.plots.update_data(data)
             if self.follow:
                 self.plots.set_x_range(t0, t1)
@@ -340,6 +484,8 @@ class MainWindow(QWidget):
                 t1 = now
                 t0 = now - self.span_s
                 data, (table, is_agg) = query_history(self.root, t0, t1, self.nch)
+                for ch in self.env_chs:
+                    data[(ch, "T")] = query_history_env(self.root, t0, t1, [ch])[ch]
                 self.plots.update_data(data)
                 self._hist_info = "数据库 %s（跨天合并）" % table
                 if not self.follow:
@@ -354,10 +500,25 @@ class MainWindow(QWidget):
         dur = (now - self.t_start) if self.t_start else 0
         h, rem = divmod(int(dur), 3600)
         m, s = divmod(rem, 60)
+
+        # 温度与温差（用户最关心 ΔT）
+        t_txt = ""
+        if self.env_chs:
+            parts = []
+            for ch in self.env_chs:
+                v = self.buf.env_latest.get(ch)
+                parts.append("T%d=%s" % (ch, "—" if v is None else "%.1f" % v))
+            if len(self.env_chs) >= 2:
+                a = self.buf.env_latest.get(self.env_chs[0])
+                b = self.buf.env_latest.get(self.env_chs[1])
+                if a is not None and b is not None:
+                    parts.append("ΔT=%.1f ℃" % (a - b))
+            t_txt = "   " + "  ".join(parts) + " ℃"
+
         self.lbl_stats.setText(
-            "轮数 %d   周期 %.2f s   余量 %s   点数 %d   时长 %d:%02d:%02d   来源 %s"
+            "轮数 %d   周期 %.2f s   余量 %s   点数 %d   时长 %d:%02d:%02d   来源 %s%s"
             % (self.n_rounds, self.spin_interval.value(), lag_txt,
-               self.buf.n_total, h, m, s, self._hist_info or "—"))
+               self.buf.n_total, h, m, s, self._hist_info or "—", t_txt))
 
     def _update_store_label(self):
         try:
@@ -381,6 +542,10 @@ class MainWindow(QWidget):
 
     # ==================================================================
     def closeEvent(self, e):
+        if self.env_worker and self.env_worker.isRunning():
+            self._append_log("关闭窗口：正在停止温度采集…")
+            self.env_worker.stop()
+            self.env_worker.wait(3000)
         if self.worker and self.worker.isRunning():
             self._append_log("关闭窗口：正在让采集线程优雅收尾…")
             self.worker.stop()

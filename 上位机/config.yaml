@@ -48,6 +48,32 @@ devices:
     timeout_s: 1.0
     heartbeat_s: 5              # 每隔几秒发一次 PING 喂看门狗（固件 10 s 超时）
 
+  # ==== 温度采集器（TA612，USB-串口，9600 8N1）====
+  # 协议：帧头 0x55AA + 指令 + 帧长 + 4 通道数据(16bit×4) + Sum
+  #       温度 = 原始值 / 10，单位 ℃；校验 = 从帧头起累加取低 8 位
+  tasensor:
+    enabled: true
+    port: "COM4"                # ★ 实测：TA612 在此口
+    baud: 9600
+    timeout_s: 1.0
+    # 采样节奏（温度变化慢，不需要跟测量轮同频）
+    interval_s: 5.0             # 每 5 秒采一次温度
+    channels: [1, 2]            # ★ 只用 ch1/ch2（ch3/ch4 未接传感器，实测返回 28000）
+    invalid_above: 100.0        # 超过这个值视为无效（未接传感器），不入库
+
+  # ==== 直流电压源（Wanptek，MODBUS-RTU）用于驱动 ch1/ch2 温差 ====
+  # ★ 实测：波特率 2400（默认）、从站地址 0（默认）、数据小端
+  #   设备规格 31V/5.2A；寄存器值换算：电压/100、电流/1000（VPOD=0、IPOD=0）
+  powersupply:
+    enabled: true
+    port: "COM13"
+    baud: 2400                  # ★ 实测（不是 9600！）
+    addr: 0                     # ★ 实测（默认 0，不是 1）
+    protocol: "modbus"          # modbus（真机） / none（dry-run 只记录不发送）
+    settle_s: 2.0               # 改电压后等待热稳定
+    max_voltage: 31.0           # ★ 设备实测最大 31V；超过直接拒绝
+    off_on_exit: false          # 退出程序时是否关输出（false=保持，免得打断控温实验）
+
 timing:
   # 与固件里的值保持一致（仅用于"本轮耗时估算 + 间隔保护"，不用于实际控制）
   t_open_ms: 30

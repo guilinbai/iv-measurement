@@ -32,12 +32,14 @@ class AcquisitionWorker(QThread):
     sig_stats = Signal(dict)
     sig_failed = Signal(str)
 
-    def __init__(self, cfg, interval=None, port=None, max_rounds=None, parent=None):
+    def __init__(self, cfg, interval=None, port=None, max_rounds=None,
+                 env_queue=None, parent=None):
         super().__init__(parent)
         self.cfg = cfg
         self.interval = interval or float(cfg["acquisition"]["interval_s"])
         self.port = port
         self.max_rounds = max_rounds
+        self.env_queue = env_queue        # 温度数据队列（由界面线程投递）
         self._stop = False
 
         self.arduino = None
@@ -125,9 +127,11 @@ class AcquisitionWorker(QThread):
         nch = int(cfg["acquisition"]["channels"])
 
         # --- 存储 ---
+        ta = cfg["devices"]["tasensor"]
+        env_chs = list(ta["channels"]) if ta.get("enabled") else []
         self.storage = Storage(cfg["storage"]["dir"],
                                write_csv=cfg["storage"]["write_csv_realtime"],
-                               nch=nch, verbose=False)
+                               nch=nch, env_channels=env_chs, verbose=False)
         last = self.storage.last_ts()
         if last:
             self._log("上次数据到: %s"
@@ -149,11 +153,30 @@ class AcquisitionWorker(QThread):
         self.sig_state_msg.emit("running", "采集中")
 
         def on_round(rno, samples, t_round, lag):
+            self._drain_env()                 # 顺手把积压的温度数据落盘
             self.sig_round.emit(rno, (samples, t_round, lag))
 
         self.stats = self.acq.run(max_rounds=self.max_rounds,
                                   stop_flag=lambda: self._stop,
                                   on_round=on_round)
+
+    def _drain_env(self, max_n=200):
+        """把温度队列里积压的数据写入存储（在采集线程里做，不跨线程碰 SQLite）。"""
+        if not self.env_queue or not self.storage:
+            return
+        n = 0
+        while n < max_n:
+            try:
+                ts, vals = self.env_queue.get_nowait()
+            except Exception:
+                break
+            try:
+                self.storage.write_env(vals, ts=ts)
+                n += 1
+            except Exception as e:
+                self._log("[!] 温度写盘失败: %s" % str(e)[:60])
+        if n:
+            self._log("温度已落盘 %d 条" % n)
 
     # ------------------------------------------------------------------
     def _finish(self):
@@ -200,6 +223,67 @@ class AcquisitionWorker(QThread):
 
 
 # ============================================================================
+#  环境量采集线程（温度，独立节奏，不干扰测量）
+# ============================================================================
+class EnvWorker(QThread):
+    """按固定间隔读 TA612 温度。
+
+    只负责"采 + 发信号"，**不碰数据库**（避免两个线程写同一个 SQLite 连接）。
+    落盘由测量线程从队列取出后统一写入（见 AcquisitionWorker 的 env_queue）。
+    """
+
+    sig_env = Signal(float, object)      # (ts, {ch: 温度})
+    sig_log = Signal(str)
+    sig_error = Signal(str)
+
+    def __init__(self, cfg, parent=None):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.interval = float(cfg["devices"]["tasensor"]["interval_s"])
+        self._stop = False
+        self.ok_count = 0
+        self.err_count = 0
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        from ivcore.tasensor import TASensor, TASensorError
+
+        d = self.cfg["devices"]["tasensor"]
+        sensor = TASensor(d["port"], d["baud"], d["timeout_s"])
+        try:
+            info = sensor.open(verbose=False)
+            self.sig_log.emit("温度采集器已连接: %s @ %s（每 %.1f s 采一次）"
+                              % (info, d["port"], self.interval))
+        except TASensorError as e:
+            self.sig_error.emit(str(e))
+            return
+
+        try:
+            while not self._stop:
+                t0 = time.monotonic()
+                try:
+                    vals = sensor.read_temperatures(
+                        channels=d["channels"], invalid_above=d["invalid_above"])
+                    self.sig_env.emit(time.time(), vals)
+                    self.ok_count += 1
+                except TASensorError as e:
+                    self.err_count += 1
+                    if self.err_count in (1, 10) or self.err_count % 100 == 0:
+                        self.sig_error.emit("温度读取失败(%d次): %s"
+                                            % (self.err_count, e))
+                # 分片睡眠，保证能及时响应停止
+                end = t0 + self.interval
+                while time.monotonic() < end and not self._stop:
+                    time.sleep(min(0.1, max(0.0, end - time.monotonic())))
+        finally:
+            sensor.close()
+            self.sig_log.emit("温度采集器已关闭（成功 %d 次 / 失败 %d 次）"
+                              % (self.ok_count, self.err_count))
+
+
+# ============================================================================
 #  模拟采集（不接硬件，只用来看界面效果 / 验证绘图性能）
 # ============================================================================
 class FakeWorker(QThread):
@@ -209,14 +293,16 @@ class FakeWorker(QThread):
     sig_state_msg = Signal(str, str)
     sig_log = Signal(str)
     sig_round = Signal(int, object)
+    sig_env = Signal(float, object)      # 假温度数据
     sig_stats = Signal(dict)
     sig_failed = Signal(str)
 
-    def __init__(self, cfg, interval=0.2, nch=4, parent=None):
+    def __init__(self, cfg, interval=0.2, nch=4, env_channels=None, parent=None):
         super().__init__(parent)
         self.cfg = cfg
         self.interval = interval
         self.nch = nch
+        self.env_channels = list(env_channels or [])
         self._stop = False
 
     def stop(self):
@@ -227,8 +313,13 @@ class FakeWorker(QThread):
         import random
         self.sig_state_msg.emit("running", "模拟采集（假数据）")
         self.sig_log.emit("模拟模式：不连接硬件，生成假数据")
+        if self.env_channels:
+            self.sig_log.emit("模拟温度通道: %s（ch1 逐渐升温、ch2 基本不变，ΔT 逐渐拉大）"
+                              % self.env_channels)
         rno = 0
         t0 = time.time()
+        n_env_every = max(1, int(round(2.0 / self.interval)))   # 约每 2 秒发一次温度
+
         try:
             while not self._stop:
                 rno += 1
@@ -247,6 +338,17 @@ class FakeWorker(QThread):
                             unit = "A"
                         samples.append((gts + ch * 0.02, ch, mode, v, unit, 0))
                 self.sig_round.emit(rno, (samples, gts, 0.0))
+
+                # 假温度：ch1 随"驱动电压"线性升温（模拟 ΔT 拉大）
+                if self.env_channels and rno % n_env_every == 0:
+                    el = time.time() - t0
+                    heat = min(12.0, el * 0.25)          # 最多升 12℃
+                    vals = {}
+                    for i, ch in enumerate(self.env_channels):
+                        vals[ch] = (26.5 + (heat if i == 0 else 0.0)
+                                    + random.gauss(0, 0.05))
+                    self.sig_env.emit(time.time(), vals)
+
                 time.sleep(self.interval)
         finally:
             self.sig_stats.emit({"rounds": rno, "samples": rno * self.nch * 2,
