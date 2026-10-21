@@ -65,6 +65,8 @@ class MainWindow(QWidget):
         self._auto_fit = True
         # 上次由程序设置的 X 范围；用来检测"用户是否手动缩放/平移过"
         self._last_set_xr = None
+        # 温度超限保护是否已触发（避免重复关电源）
+        self._overheat_tripped = False
 
         self.setWindowTitle("4 路 IV 测量 · 实时监视  (v0.3 · 含温度)")
         self.resize(1280, 900)
@@ -435,6 +437,9 @@ class MainWindow(QWidget):
                             "，温度随每轮采集" if self.env_chs else ""))
 
     def _stop(self):
+        # ★ 如果配置要求"停止时也关电源"，先关（防火）
+        if self.cfg.get("safety", "on_stop_off", default=False) and self.ps:
+            self._shutdown_power("停止采集（安全设置 on_stop_off）")
         if self.worker and self.worker.isRunning():
             self.btn_stop.setEnabled(False)
             self._append_log("正在停止（等当前轮结束并收尾）…")
@@ -442,8 +447,35 @@ class MainWindow(QWidget):
 
     # ------------------------------------------------------------------
     def _on_env(self, ts, vals):
-        """收到一轮温度（界面线程）：只更新显示缓冲（落盘由采集线程做）。"""
+        """收到一轮温度（界面线程）：更新显示缓冲 + 温度上限保护。"""
         self.buf.add_env(ts, vals)
+        self._check_overheat(vals)
+
+    def _check_overheat(self, vals):
+        """★ 温度上限保护：超过 safety.max_temp_c 就立刻关电源输出。"""
+        try:
+            lim = float(self.cfg.get("safety", "max_temp_c", default=0) or 0)
+        except Exception:
+            lim = 0.0
+        if lim <= 0:
+            return
+        hot = [(ch, v) for ch, v in (vals or {}).items()
+               if v is not None and v > lim]
+        if not hot:
+            if self._overheat_tripped:
+                self._append_log("[安全] 温度已回落到 %.1f℃ 以下（输出不会自动重开，"
+                                 "请确认后手动开启）" % lim)
+                self._overheat_tripped = False
+            return
+        if self._overheat_tripped or not self.ps:
+            return
+        self._overheat_tripped = True
+        ch, t = max(hot, key=lambda x: x[1])
+        self._append_log("=" * 60)
+        self._append_log("[安全][!] 温度 T%d = %.1f℃ 超过上限 %.1f℃ → 立即关闭电源输出！"
+                         % (ch, t, lim))
+        self._append_log("=" * 60)
+        self._shutdown_power("温度超限 %.1f℃" % t)
 
     # ==================================================================
     #  采集线程回调（全部在界面线程执行）
@@ -664,7 +696,44 @@ class MainWindow(QWidget):
         self.txt_log.appendPlainText("[%s] %s" % (ts, msg))
 
     # ==================================================================
+    # ------------------------------------------------------------------
+    #  ★ 安全：关闭电源输出（防火）
+    # ------------------------------------------------------------------
+    def _shutdown_power(self, reason="关闭程序"):
+        """尽最大努力关闭电源输出。返回 True 表示已确认关闭。"""
+        if not self.ps:
+            return True
+        # 连试 3 次（设备偶发不响应）
+        for attempt in range(3):
+            try:
+                self.ps.output(False)
+                self._append_log("[安全] %s：已关闭电源输出" % reason)
+                return True
+            except Exception as ex:
+                self._append_log("[安全] 第 %d 次关输出失败：%s"
+                                 % (attempt + 1, str(ex)[:70]))
+                time.sleep(0.3)
+        # 兜底：直接把输出关掉（用底层写控制字）
+        try:
+            self.ps.read_status()
+            vs = self.ps.info.get("v_scale", 100.0)
+            is_ = self.ps.info.get("i_scale", 1000.0)
+            v_raw = int(round((self.ps.set_v or 0) * vs))
+            i_raw = int(round((self.ps.set_a or 1.0) * is_))
+            if self.ps._write3(0x0000, v_raw, i_raw):     # 控制字全 0 = 输出关
+                self._append_log("[安全] 已用兜底方式关闭电源输出")
+                return True
+        except Exception as ex:
+            self._append_log("[安全][!] 兜底关输出也失败：%s" % str(ex)[:70])
+        self._append_log("[安全][!] ⚠ 电源输出可能仍处于开启状态，"
+                         "请立刻手动关闭电源或拔掉输出线！")
+        return False
+
     def closeEvent(self, e):
+        # ★★★ 第一优先：先关电源输出（防止加热器无人看管）★★★
+        if self.ps:
+            self._shutdown_power("关闭窗口")
+
         if self.env_worker and self.env_worker.isRunning():
             self._append_log("关闭窗口：正在停止温度采集…")
             self.env_worker.stop()
@@ -674,4 +743,16 @@ class MainWindow(QWidget):
             self.worker.stop()
             if not self.worker.wait(15000):
                 self._append_log("[!] 收尾超时，强制退出（数据已落盘，可事后校验）")
+
+        # 再关一次（采集线程收尾期间可能有其他写入）
+        if self.ps:
+            try:
+                self.ps.output(False)
+            except Exception:
+                pass
+            try:
+                self.ps.close(off_output=True)
+            except Exception:
+                pass
+            self.ps = None
         e.accept()

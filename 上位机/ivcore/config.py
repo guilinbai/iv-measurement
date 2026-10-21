@@ -78,7 +78,12 @@ class Config:
         ps.setdefault("settle_s", 2.0)
         ps.setdefault("max_voltage", 31.0)
         ps.setdefault("timeout_s", 0.5)
-        ps.setdefault("off_on_exit", False)
+        ps.setdefault("off_on_exit", True)      # ★ 默认关闭时关输出（防火）
+
+        # ---- 安全保护 ----
+        sf = self.raw.setdefault("safety", {})
+        sf.setdefault("max_temp_c", 0)          # 0 = 不启用温度上限保护
+        sf.setdefault("on_stop_off", False)
 
         tm = self.raw.setdefault("timing", {})
         tm.setdefault("t_open_ms", 30)
@@ -134,6 +139,7 @@ class Config:
     def dump_summary(self):
         """打印一份配置摘要。"""
         aq, st = self.raw["acquisition"], self.raw["storage"]
+        sf = self.raw.get("safety", {})
         dv = self.raw["devices"]
         lines = [
             "配置摘要 (%s)" % os.path.basename(self.path),
@@ -146,10 +152,15 @@ class Config:
             "  电流表      : %s" % dv["dmm_current"].get("resource", "(未配置)"),
             "  Arduino     : %s" % (dv["arduino"].get("port") or "(自动探测)"),
             "  温度采集器  : %s"
-            % ("%s @ %s，每 %.0f s 采一次，通道 %s"
-               % ("TA 系列", dv["tasensor"]["port"], dv["tasensor"]["interval_s"],
-                  dv["tasensor"]["channels"])
+            % ("TA 系列 @ %s，随每轮测量采一次 %d 通道，上限 %s"
+               % (dv["tasensor"]["port"],
+                  len(dv["tasensor"]["channels"]),
+                  ("%.0f℃" % sf["max_temp_c"]) if sf.get("max_temp_c") else "未设")
                if dv["tasensor"]["enabled"] else "未启用"),
+            "  安全保护    : 关闭程序时%s关电源输出；温度上限 %s"
+            % ("会" if dv["powersupply"]["off_on_exit"] else "不会",
+               ("%.0f℃（超限自动断电）" % sf.get("max_temp_c", 0))
+               if sf.get("max_temp_c") else "未启用"),
             "  电压源      : %s"
             % ("%s @ %d bps 地址%d，协议 %s，上限 %.1f V"
                % (dv["powersupply"]["port"], dv["powersupply"]["baud"],
