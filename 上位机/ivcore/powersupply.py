@@ -86,6 +86,7 @@ class PowerSupply:
 
         self.ser = None
         self.info = {}                  # 最近一次读到的状态
+        self.last_verify = {}           # 最近一次设电压后的"设定 vs 实测"校验结果
         self.max_voltage = max_voltage  # 若为 None 则从设备读
         self.set_v = None
         self.set_a = None
@@ -338,10 +339,28 @@ class PowerSupply:
         if settle and self.settle_s > 0:
             time.sleep(self.settle_s)
         self.read_status()          # ★ 回读确认
-        if abs(self.info.get("vset", -1) - v) > max(0.02, v * 0.002):
+        i = self.info
+        if abs(i.get("vset", -1) - v) > max(0.02, v * 0.002):
             raise PowerSupplyError(
-                "%s: 写入后回读 %.2f V，与设定 %.2f V 不符"
-                % (self.name, self.info.get("vset", -1), v))
+                "%s: 写入后回读设定值 %.2f V，与设定 %.2f V 不符"
+                % (self.name, i.get("vset", -1), v))
+
+        # ★ 设定值 vs 实测值 的差异检查（只在 CV 模式下有意义；
+        #   CC 模式实测电压本来就会低于设定值）
+        self.last_verify = {
+            "vset": i.get("vset"), "volt": i.get("volt"),
+            "curr": i.get("curr"), "cv": i.get("cv"),
+            "diff": (i.get("volt") or 0) - (i.get("vset") or 0),
+            "warn": "",
+        }
+        if i.get("cv") and abs(self.last_verify["diff"]) > max(0.05, v * 0.03):
+            self.last_verify["warn"] = (
+                "设定 %.2f V 但实测 %.3f V（偏差 %+.3f V，%.1f%%）。可能原因："
+                "① 负载还在变化/热态电阻变化；② 电源在特定区间有固件偏差"
+                "（本机实测 2.99~3.06 V 会偏高约 +0.22 V）；③ 读数时机太早。"
+                "若需要精确电压，建议避开该区间或等一下再看"
+                % (i.get("vset"), i.get("volt"), self.last_verify["diff"],
+                   100.0 * self.last_verify["diff"] / max(0.01, v)))
         return v
 
     def set_current(self, amps, settle=False):

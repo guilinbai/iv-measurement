@@ -343,6 +343,14 @@ class MainWindow(QWidget):
         try:
             self.ps.set_voltage(v)
             self._append_log("电压源设为 %.2f V" % v)
+            # ★ 设定 vs 实测 校验：偏差大就提示（本机 2.99~3.06V 有已知偏高）
+            lv = getattr(self.ps, "last_verify", {}) or {}
+            if lv.get("warn"):
+                self._append_log("[!] " + lv["warn"])
+            elif lv:
+                self._append_log("   校验：实测 %.3f V（偏差 %+.3f V，%s）"
+                                 % (lv.get("volt", 0), lv.get("diff", 0),
+                                    "恒压" if lv.get("cv") else "恒流"))
         except Exception as e:
             self._append_log("[!] 设置电压失败: %s" % e)
         self._refresh_ps_label()
