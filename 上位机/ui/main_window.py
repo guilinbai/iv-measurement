@@ -361,15 +361,9 @@ class MainWindow(QWidget):
         self.worker.sig_round.connect(self._on_round)
         self.worker.sig_stats.connect(self._on_stats)
         self.worker.sig_failed.connect(self._on_failed)
+        if hasattr(self.worker, "sig_env"):
+            self.worker.sig_env.connect(self._on_env)   # 温度（与测量同一轮）
         self.worker.start()
-
-        # ——— 温度采集（独立线程，节奏由 config 的 tasensor.interval_s 决定）———
-        if self.env_chs and not self.fake_mode:
-            self.env_worker = EnvWorker(self.cfg)
-            self.env_worker.sig_env.connect(self._on_env)
-            self.env_worker.sig_log.connect(self._append_log)
-            self.env_worker.sig_error.connect(lambda m: self._append_log("[!] " + m))
-            self.env_worker.start()
 
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
@@ -377,11 +371,9 @@ class MainWindow(QWidget):
         self.spin_interval.setEnabled(False)
         self._append_log("——— 开始采集（间隔 %.2f s，%s%s）———"
                          % (iv, "模拟模式" if self.fake_mode else "真实硬件",
-                            "，温度采集已启动" if self.env_worker else ""))
+                            "，温度随每轮采集" if self.env_chs else ""))
 
     def _stop(self):
-        if self.env_worker and self.env_worker.isRunning():
-            self.env_worker.stop()
         if self.worker and self.worker.isRunning():
             self.btn_stop.setEnabled(False)
             self._append_log("正在停止（等当前轮结束并收尾）…")
@@ -389,9 +381,8 @@ class MainWindow(QWidget):
 
     # ------------------------------------------------------------------
     def _on_env(self, ts, vals):
-        """收到一次温度采样（界面线程）。"""
+        """收到一轮温度（界面线程）：只更新显示缓冲（落盘由采集线程做）。"""
         self.buf.add_env(ts, vals)
-        self.env_queue.put((ts, vals))      # 交给采集线程落盘
 
     # ==================================================================
     #  采集线程回调（全部在界面线程执行）

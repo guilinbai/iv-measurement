@@ -86,6 +86,7 @@ class Config:
         tm.setdefault("t_window_ms", 50)
         tm.setdefault("t_off_ms", 20)
         tm.setdefault("switch_overhead_ms", 40)
+        tm.setdefault("t_env_ms", 150)
 
         ui = self.raw.setdefault("ui", {})
         ui.setdefault("refresh_hz", 3)
@@ -112,11 +113,15 @@ class Config:
                 + t["t_off_ms"] + 10)
 
     def round_cost_s(self, nch=None):
-        """一轮（4 路 × V+I）预计耗时（秒）。"""
+        """一轮（4 路 × V+I + 一次温度）预计耗时（秒）。"""
         nch = nch or self.raw["acquisition"]["channels"]
         per = self.per_measure_ms() / 1000.0
-        switch = self.raw["timing"]["switch_overhead_ms"] / 1000.0
-        return per * nch * 2 + switch
+        tm = self.raw["timing"]
+        switch = tm["switch_overhead_ms"] / 1000.0
+        # 每轮随测量采一次温度（一问一答，约 t_env_ms）
+        env = (tm.get("t_env_ms", 0) / 1000.0) if self.raw["devices"].get(
+            "tasensor", {}).get("enabled") else 0.0
+        return per * nch * 2 + switch + env
 
     def min_interval_s(self, margin=1.2):
         """建议的最小采样间隔（含安全余量）。"""

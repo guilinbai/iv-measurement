@@ -42,6 +42,7 @@ class Acquisition:
         self.n_failed = 0
         self._slow_rounds = 0
         self.t_grid0 = None          # 网格基准（墙钟），时间列 = t_grid0 + n×间隔
+        self.last_grid_ts = None     # 最近一轮的网格时刻（温度采集与它对齐）
 
     # ------------------------------------------------------------------
     def _dmm_for(self, mode):
@@ -116,6 +117,7 @@ class Acquisition:
             self.t_first = samples[0][0]
 
         self.n_samples += len(samples)
+        self.last_grid_ts = grid_ts       # 供外部（温度采集）对齐同一轮用
         self.storage.write_round(samples, grid_ts=grid_ts, round_id=rid)
         return samples, t_round
 

@@ -102,15 +102,17 @@ class Storage:
         n_bad    INTEGER
     );
 
-    -- 环境数据（温度/湿度），独立节奏（如每 5 秒一次），与测量共用时间轴
+    -- 环境数据（温度/湿度）：**与测量同一轮采样**，带同一个 grid_ts / round_id
     CREATE TABLE IF NOT EXISTS env (
-        ts      REAL,
-        run_id  INTEGER,
-        sensor  TEXT,
-        ch      INTEGER,
-        value   REAL,
-        unit    TEXT,
-        quality INTEGER DEFAULT 0
+        ts       REAL,               -- 实际读取时刻
+        grid_ts  REAL,               -- ★ 所属轮次的网格时刻（与 samples 对齐）
+        run_id   INTEGER,
+        round_id INTEGER,            -- ★ 轮号（与 samples.csv 的 round_id 一致）
+        sensor   TEXT,
+        ch       INTEGER,
+        value    REAL,
+        unit     TEXT,
+        quality  INTEGER DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS agg_1min (
@@ -162,8 +164,8 @@ class Storage:
         self.n_env = 0
         self._pending_agg = {}
 
-        # 环境数据宽表列：iso_time, t1, t2, ..., dt（温差）
-        self.env_cols = ["iso_time"]
+        # 环境数据宽表列：iso_time, round_id, t1, t2, ..., dt（温差）
+        self.env_cols = ["iso_time", "round_id"]
         for ch in self.env_channels:
             self.env_cols.append("t%d" % ch)
         if len(self.env_channels) >= 2:
@@ -216,9 +218,27 @@ class Storage:
                 self.csv_file.flush()
             self.n_csv = self._count_csv_rows(csv_path)
 
-            # 环境数据单独一个 CSV（一行一次采样）
+            # 环境数据单独一个 CSV（一行一轮，与 samples 的 round_id 对齐）
             if self.env_channels:
                 env_path = os.path.join(d, "%s_env.csv" % day)
+                # ★ 表头与当前列不一致（例如旧版本是 4 列）→ 把旧文件归档，避免格式混在一起
+                if os.path.exists(env_path) and os.path.getsize(env_path) > 0:
+                    try:
+                        with open(env_path, "r", encoding="utf-8") as f:
+                            old_head = (f.readline() or "").strip()
+                        if old_head and old_head.split(",") != self.env_cols:
+                            bak = env_path.replace(".csv", "_oldformat.csv")
+                            n = 1
+                            while os.path.exists(bak):
+                                bak = env_path.replace(".csv", "_oldformat%d.csv" % n)
+                                n += 1
+                            os.replace(env_path, bak)
+                            if self.verbose:
+                                print("      环境 CSV 表头已变更（旧: %s），"
+                                      "旧文件已归档为 %s"
+                                      % (old_head, os.path.basename(bak)))
+                    except Exception:
+                        pass
                 new_env = (not os.path.exists(env_path)) or os.path.getsize(env_path) == 0
                 self.env_file = open(env_path, "a", newline="", encoding="utf-8")
                 self.env_writer = csv.writer(self.env_file)
@@ -233,7 +253,11 @@ class Storage:
         return True
 
     def _migrate(self):
-        """老库补列（例如上一版没有 grid_ts）。"""
+        """老库补列（samples 的 grid_ts、env 的 grid_ts/round_id）。
+
+        注意：CREATE TABLE IF NOT EXISTS **不会**修改已存在的表，
+        所以每次加新列都必须在这里补，否则新代码 INSERT 会一直报错。
+        """
         try:
             cols = [r[1] for r in self.con.execute("PRAGMA table_info(samples)")]
             if "grid_ts" not in cols:
@@ -242,9 +266,24 @@ class Storage:
                     "UPDATE samples SET grid_ts = ts WHERE grid_ts IS NULL")
                 self.con.commit()
                 if self.verbose:
-                    print("      (已给旧库补上 grid_ts 列)")
-        except Exception:
-            pass
+                    print("      (已给旧库 samples 补上 grid_ts 列)")
+
+            ecols = [r[1] for r in self.con.execute("PRAGMA table_info(env)")]
+            added = []
+            if ecols and "grid_ts" not in ecols:
+                self.con.execute("ALTER TABLE env ADD COLUMN grid_ts REAL")
+                self.con.execute("UPDATE env SET grid_ts = ts WHERE grid_ts IS NULL")
+                added.append("grid_ts")
+            if ecols and "round_id" not in ecols:
+                self.con.execute("ALTER TABLE env ADD COLUMN round_id INTEGER")
+                added.append("round_id")
+            if added:
+                self.con.commit()
+                if self.verbose:
+                    print("      (已给旧库 env 补上 %s 列)" % "、".join(added))
+        except Exception as e:
+            if self.verbose:
+                print("      [!] 迁移出错: %s" % str(e)[:80])
 
     def _close_files(self):
         if self.con:
@@ -376,28 +415,32 @@ class Storage:
     # ------------------------------------------------------------------
     #  写环境数据（温度/湿度，独立节奏）
     # ------------------------------------------------------------------
-    def write_env(self, values, ts=None, sensor="TA612"):
-        """写一次环境采样。
+    def write_env(self, values, ts=None, grid_ts=None, round_id=None,
+                  sensor="TA612"):
+        """写一次环境采样（与测量同一轮）。
 
         values : {通道: 温度℃ 或 None}，如 {1: 26.7, 2: 26.7}
-        ts     : PC 时间戳（设备帧里没有时间戳，统一用 PC 时间，保证与测量共轴）
-        返回写入的行数（有效值的个数）。
+        ts     : 实际读取时刻（PC 时间）
+        grid_ts: 所属轮次的网格时刻（与 samples 表一致，用它可以和电学数据按轮对齐）
+        round_id: 轮号（与 samples.csv 的 round_id 一致）
         """
         ts = ts or time.time()
         self._rollover(ts=ts)
+        rid = self.round_id if round_id is None else round_id
+        gts = ts if grid_ts is None else grid_ts
 
-        rows = [(ts, self.run_id, sensor, ch, val, "C", 0)
+        rows = [(ts, gts, self.run_id, rid, sensor, ch, val, "C", 0)
                 for ch, val in sorted(values.items()) if val is not None]
         if rows:
             self.con.executemany(
-                "INSERT INTO env (ts, run_id, sensor, ch, value, unit, quality)"
-                " VALUES (?,?,?,?,?,?,?)", rows)
+                "INSERT INTO env (ts, grid_ts, run_id, round_id, sensor, ch,"
+                " value, unit, quality) VALUES (?,?,?,?,?,?,?,?,?)", rows)
             self.con.commit()
             self.n_env += len(rows)
 
-        # ---- CSV 宽表（一行一次采样）----
+        # ---- CSV 宽表（一行一轮，与 samples.csv 的 round_id 对齐）----
         if self.env_writer and self.env_channels:
-            row = [_iso_sec(ts)]
+            row = [_iso_sec(gts), rid]
             for ch in self.env_channels:
                 v = values.get(ch)
                 row.append("" if v is None else "%.2f" % v)

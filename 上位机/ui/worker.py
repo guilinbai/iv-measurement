@@ -31,6 +31,7 @@ class AcquisitionWorker(QThread):
     sig_round = Signal(int, object)
     sig_stats = Signal(dict)
     sig_failed = Signal(str)
+    sig_env = Signal(float, object)          # (网格时刻, {ch: 温度}) 与测量同一轮
 
     def __init__(self, cfg, interval=None, port=None, max_rounds=None,
                  env_queue=None, parent=None):
@@ -126,6 +127,22 @@ class AcquisitionWorker(QThread):
         cfg = self.cfg
         nch = int(cfg["acquisition"]["channels"])
 
+        # --- 温度采集器（与测量同一轮）---
+        self.tas = None
+        self._env_ok = 0
+        self._env_fail = 0
+        ta = cfg["devices"]["tasensor"]
+        if ta.get("enabled"):
+            from ivcore.tasensor import TASensor
+            try:
+                self.tas = TASensor(ta["port"], ta["baud"], ta["timeout_s"])
+                info = self.tas.open(verbose=False)
+                self._log("温度采集器: %s @ %s（每轮随测量采一次）"
+                          % (info, ta["port"]))
+            except Exception as e:
+                self._log("[!] 温度采集器打开失败（继续，无温度）: %s" % str(e)[:80])
+                self.tas = None
+
         # --- 存储 ---
         ta = cfg["devices"]["tasensor"]
         env_chs = list(ta["channels"]) if ta.get("enabled") else []
@@ -153,30 +170,38 @@ class AcquisitionWorker(QThread):
         self.sig_state_msg.emit("running", "采集中")
 
         def on_round(rno, samples, t_round, lag):
-            self._drain_env()                 # 顺手把积压的温度数据落盘
+            self._read_env()                  # ★ 每轮采一次温度（与测量同一轮）
             self.sig_round.emit(rno, (samples, t_round, lag))
 
         self.stats = self.acq.run(max_rounds=self.max_rounds,
                                   stop_flag=lambda: self._stop,
                                   on_round=on_round)
 
-    def _drain_env(self, max_n=200):
-        """把温度队列里积压的数据写入存储（在采集线程里做，不跨线程碰 SQLite）。"""
-        if not self.env_queue or not self.storage:
+    def _read_env(self):
+        """每轮采一次温度（与测量同一轮、同一 grid_ts / round_id）。"""
+        if not self.tas or not self.storage or not self.acq:
             return
-        n = 0
-        while n < max_n:
-            try:
-                ts, vals = self.env_queue.get_nowait()
-            except Exception:
-                break
-            try:
-                self.storage.write_env(vals, ts=ts)
-                n += 1
-            except Exception as e:
-                self._log("[!] 温度写盘失败: %s" % str(e)[:60])
-        if n:
-            self._log("温度已落盘 %d 条" % n)
+        ta = self.cfg["devices"]["tasensor"]
+        try:
+            vals = self.tas.read_temperatures(channels=ta["channels"],
+                                              invalid_above=ta["invalid_above"])
+        except Exception as e:
+            self._env_fail += 1
+            if self._env_fail in (1, 10) or self._env_fail % 100 == 0:
+                self._log("[!] 温度读取失败(%d次): %s" % (self._env_fail, str(e)[:70]))
+            return
+        gts = self.acq.last_grid_ts
+        try:
+            self.storage.write_env(vals, ts=time.time(), grid_ts=gts,
+                                   round_id=self.storage.round_id)
+            self.sig_env.emit(gts or time.time(), vals)
+            self._env_ok += 1
+        except Exception as e:
+            self._log("[!] 温度写盘失败: %s" % str(e)[:70])
+
+    def _drain_env(self, max_n=200):
+        """兼容旧接口（现在温度已随轮直接落盘，不再需要队列）。"""
+        pass
 
     # ------------------------------------------------------------------
     def _finish(self):
@@ -210,6 +235,13 @@ class AcquisitionWorker(QThread):
             try:
                 if d:
                     d.close()
+            except Exception:
+                pass
+        if self.tas:
+            try:
+                self.tas.close()
+                self._log("温度采集器已关闭（成功 %d / 失败 %d 次）"
+                          % (self._env_ok, self._env_fail))
             except Exception:
                 pass
         if self.arduino:

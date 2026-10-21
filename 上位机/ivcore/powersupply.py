@@ -247,13 +247,48 @@ class PowerSupply:
     # ------------------------------------------------------------------
     #  写
     # ------------------------------------------------------------------
-    def _write_reg(self, reg, value):
-        """写单个寄存器（用 0x10）。"""
-        val = int(round(value)) & 0xFFFF
-        body = [self.addr, 0x10, reg >> 8, reg & 0xFF, 0x00, 0x01, 0x02,
-                (val >> 8) & 0xFF, val & 0xFF]
-        r = self._xfer(body[1:], 8)
-        return len(r) >= 8
+    def _ctrl_word(self, out_on=None, ocp=None):
+        """推断"控制寄存器"的字。
+
+        状态寄存器0 的 PS(bit8) ↔ 控制寄存器 OUTCTRL(bit8)
+                     OS(bit9) ↔ 控制寄存器 OCP(bit9)
+        """
+        i = self.info or {}
+        out = i.get("out_on", True) if out_on is None else bool(out_on)
+        o = i.get("ocp", False) if ocp is None else bool(ocp)
+        return ((1 if out else 0) << 8) | ((1 if o else 0) << 9)
+
+    def _write3(self, ctrl, v_raw, i_raw):
+        """★ 本设备固件要求：**一次写满 3 个寄存器**（start=0x0000, count=3）。
+
+        实测：写单个寄存器（count=1）设备**完全不回应也不生效**；
+              一次写 3 个（0x0000 控制 / 0x0001 电压 / 0x0002 电流）立即成功。
+        数据段为小端（低字节在前）。
+        """
+        if self.protocol == "none":
+            return True
+        if not self.ser:
+            raise PowerSupplyError("%s: 串口未打开" % self.name)
+
+        body = [self.addr, 0x10, 0x00, 0x00, 0x00, 0x03, 0x06,
+                ctrl & 0xFF, (ctrl >> 8) & 0xFF,
+                int(v_raw) & 0xFF, (int(v_raw) >> 8) & 0xFF,
+                int(i_raw) & 0xFF, (int(i_raw) >> 8) & 0xFF]
+        frame = _with_crc(body)
+        try:
+            self.ser.reset_input_buffer()
+            self.ser.write(frame)
+            self.ser.flush()
+        except Exception as e:
+            raise PowerSupplyError("%s: 发送失败 (%s)" % (self.name, e))
+
+        buf = b""
+        t0 = time.monotonic()
+        while len(buf) < 8 and time.monotonic() - t0 < max(1.0, self.timeout * 3):
+            c = self.ser.read(8 - len(buf))
+            if c:
+                buf += c
+        return len(buf) >= 8 and _check_crc(buf)
 
     def set_voltage(self, volts, settle=True):
         """设置输出电压（V）。超过设备最大电压会拒绝。"""
@@ -271,13 +306,22 @@ class PowerSupply:
             self.set_v = v
             return v
 
-        scale = self.info.get("v_scale", 100.0)
-        raw = int(round(v * scale))
-        if not self._write_reg(0x0001, raw):
-            raise PowerSupplyError("%s: 设置电压无响应" % self.name)
+        vs = self.info.get("v_scale", 100.0)
+        is_ = self.info.get("i_scale", 1000.0)
+        v_raw = int(round(v * vs))
+        i_raw = int(round((self.set_a if self.set_a is not None else 1.0) * is_))
+
+        if not self._write3(self._ctrl_word(), v_raw, i_raw):
+            raise PowerSupplyError("%s: 设置电压无响应（检查波特率/站地址）" % self.name)
+
         self.set_v = v
         if settle and self.settle_s > 0:
             time.sleep(self.settle_s)
+        self.read_status()          # ★ 回读确认
+        if abs(self.info.get("vset", -1) - v) > max(0.02, v * 0.002):
+            raise PowerSupplyError(
+                "%s: 写入后回读 %.2f V，与设定 %.2f V 不符"
+                % (self.name, self.info.get("vset", -1), v))
         return v
 
     def set_current(self, amps, settle=False):
@@ -292,28 +336,49 @@ class PowerSupply:
         if self.protocol == "none":
             self.set_a = a
             return a
-        scale = self.info.get("i_scale", 1000.0)
-        if not self._write_reg(0x0002, int(round(a * scale))):
+
+        vs = self.info.get("v_scale", 100.0)
+        is_ = self.info.get("i_scale", 1000.0)
+        v_raw = int(round((self.set_v if self.set_v is not None else 0.0) * vs))
+        if not self._write3(self._ctrl_word(), v_raw, int(round(a * is_))):
             raise PowerSupplyError("%s: 设置电流无响应" % self.name)
         self.set_a = a
         if settle and self.settle_s > 0:
             time.sleep(self.settle_s)
+        self.read_status()
         return a
 
     def output(self, on):
-        """开/关输出（写线圈 0x0000）。"""
+        """开/关输出。
+
+        本机实测：单独改控制寄存器的 OUTCTRL 位**设备不响应**（回读 PS 不变），
+        所以这里写完会**回读校验**，没生效就返回 False 并说明。
+        替代方案：把电压设成 0 V 也能等效"停止驱动"。
+        """
         on = bool(on)
         if self.protocol == "none":
             self.out_on = on
             return on
-        val = 0xFF00 if on else 0x0000
-        body = [self.addr, 0x05, 0x00, 0x00,
-                (val >> 8) & 0xFF, val & 0xFF]
-        r = self._xfer(body[1:], 8)
-        if len(r) < 8:
+        if not self.info:
+            self.read_status()
+
+        vs = self.info.get("v_scale", 100.0)
+        is_ = self.info.get("i_scale", 1000.0)
+        v_raw = int(round((self.set_v if self.set_v is not None else 0.0) * vs))
+        i_raw = int(round((self.set_a if self.set_a is not None else 1.0) * is_))
+
+        if not self._write3(self._ctrl_word(out_on=on), v_raw, i_raw):
             raise PowerSupplyError("%s: 输出开关命令无响应" % self.name)
-        self.out_on = on
-        time.sleep(0.2)
+
+        time.sleep(0.3)
+        self.read_status()
+        real = bool(self.info.get("out_on"))
+        self.out_on = real
+        if real != on:
+            raise PowerSupplyError(
+                "%s: 设备没有响应输出开关（回读仍为%s）。"
+                "可改用『把电压设为 0 V』来停止驱动"
+                % (self.name, "开" if real else "关"))
         return on
 
 
