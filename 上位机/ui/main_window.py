@@ -61,6 +61,8 @@ class MainWindow(QWidget):
         self.last_lag = 0.0
         self._hist_query_t = 0.0
         self._hist_info = ""
+        # True = 刚启动/数据不足时自动贴合数据起点；用户一旦明确选跨度就关掉
+        self._auto_fit = True
 
         self.setWindowTitle("4 路 IV 测量 · 实时监视  (v0.3 · 含温度)")
         self.resize(1280, 900)
@@ -124,6 +126,21 @@ class MainWindow(QWidget):
             self.span_group.addButton(rb, i)
             ctl.addWidget(rb)
 
+        # ★ 自定义视图跨度（小时）
+        ctl.addWidget(QLabel("或"))
+        self.spin_span = QDoubleSpinBox()
+        self.spin_span.setRange(0.01, 720.0)
+        self.spin_span.setDecimals(2)
+        self.spin_span.setSingleStep(0.5)
+        self.spin_span.setSuffix(" 小时")
+        self.spin_span.setValue(1.0)
+        self.spin_span.setMinimumWidth(92)
+        ctl.addWidget(self.spin_span)
+        self.btn_span = QPushButton("确认")
+        self.btn_span.setMaximumWidth(58)
+        self.btn_span.clicked.connect(self._on_custom_span)
+        ctl.addWidget(self.btn_span)
+
         self.chk_follow = QCheckBox("跟随最新")
         self.chk_follow.setChecked(True)
         self.chk_follow.toggled.connect(self._on_follow_changed)
@@ -173,6 +190,21 @@ class MainWindow(QWidget):
             self.btn_volt_apply = QPushButton("应用")
             self.btn_volt_apply.clicked.connect(self._apply_voltage)
             bar.addWidget(self.btn_volt_apply)
+
+            # ★ 上限电流（限流）设置
+            bar.addWidget(QLabel("上限电流"))
+            self.spin_cur = QDoubleSpinBox()
+            self.spin_cur.setRange(0.001, 100.0)
+            self.spin_cur.setDecimals(3)
+            self.spin_cur.setSingleStep(0.1)
+            self.spin_cur.setSuffix(" A")
+            self.spin_cur.setValue(1.0)
+            self.spin_cur.setMinimumWidth(92)
+            bar.addWidget(self.spin_cur)
+            self.btn_cur_apply = QPushButton("应用")
+            self.btn_cur_apply.setMaximumWidth(58)
+            self.btn_cur_apply.clicked.connect(self._apply_current)
+            bar.addWidget(self.btn_cur_apply)
 
             self.btn_out = QPushButton("输出：—")
             self.btn_out.setCheckable(True)
@@ -313,6 +345,24 @@ class MainWindow(QWidget):
             self._append_log("[!] 设置电压失败: %s" % e)
         self._refresh_ps_label()
 
+    def _apply_current(self):
+        """设置上限电流（限流值）。"""
+        if not self.ps:
+            self._connect_ps()
+        if not self.ps:
+            return
+        from PySide6.QtWidgets import QApplication
+        a = self.spin_cur.value()
+        self.lbl_ps.setText("正在设置上限电流 %.3f A …" % a)
+        self.lbl_ps.setStyleSheet("color:#8a6100;")
+        QApplication.processEvents()
+        try:
+            self.ps.set_current(a)
+            self._append_log("电压源上限电流设为 %.3f A" % a)
+        except Exception as e:
+            self._append_log("[!] 设置上限电流失败: %s" % e)
+        self._refresh_ps_label()
+
     def _toggle_output(self):
         if not self.ps:
             self._connect_ps()
@@ -345,6 +395,7 @@ class MainWindow(QWidget):
 
         self.buf.clear()
         self.plots.clear()
+        self._reset_auto_fit()
         self.n_rounds = 0
         self.t_start = time.time()
 
@@ -432,8 +483,31 @@ class MainWindow(QWidget):
         if not rb or not rb.isChecked():
             return
         self.span_s = rb.property("span")
-        self._hist_query_t = 0.0          # 强制下次刷新时重新查询
-        self._append_log("视图范围 → %s" % rb.text())
+        self._apply_span("预设 %s" % rb.text())
+
+    def _on_custom_span(self):
+        """自定义视图跨度（单位：小时）。"""
+        hours = float(self.spin_span.value())
+        if hours <= 0:
+            return
+        self.span_s = hours * 3600.0
+        self._apply_span("自定义 %.2f 小时" % hours)
+
+    def _apply_span(self, label):
+        """立刻应用新的视图跨度：重新跟随 + 立即设置 X 轴范围 + 强制刷新。"""
+        self.follow = True
+        self._auto_fit = False              # ★ 用户明确选了跨度，就严格按它显示
+        if hasattr(self, "chk_follow"):
+            self.chk_follow.setChecked(True)
+        self._hist_query_t = 0.0            # 历史视图下次刷新必须重查
+        now = time.time()
+        self.plots.set_x_range(now - self.span_s, now)   # ★ 立即改横坐标
+        self._append_log("视图跨度 → %s（%.2f 小时）" % (label, self.span_s / 3600.0))
+        self._refresh()
+
+    def _reset_auto_fit(self):
+        """启动新一轮采集时恢复"自动贴合"。"""
+        self._auto_fit = True
 
     def _on_follow_changed(self, on):
         self.follow = bool(on)
@@ -449,15 +523,26 @@ class MainWindow(QWidget):
     # ==================================================================
     def _refresh(self):
         now = time.time()
-        realtime = self.span_s <= 3600 and (self.follow or self.worker is None)
+        # ≤2 小时用内存缓冲（有实时数据）；更长的跨度去数据库查（原始/聚合表）
+        realtime = self.span_s <= 7200 and (self.follow or self.worker is None)
 
         if realtime:
             t1 = now
             span_t0 = now - self.span_s
-            # 数据还不够铺满视图跨度时（刚启动），从数据起点开始显示，
-            # 否则曲线会全部挤在最右边一条线上，看不出形状。
-            tmin, _tmax = self.buf.span()
-            t0 = span_t0 if (tmin is None or tmin <= span_t0) else tmin
+            # 只有"自动贴合"模式（刚启动、数据不足以铺满跨度）才从数据起点显示；
+            # 用户明确选过跨度后，就严格按所选跨度显示（曲线短一点很正常）。
+            if self._auto_fit:
+                tmin, _tmax = self.buf.span()
+                if tmin is not None and tmin > span_t0:
+                    t0 = tmin
+                    # 数据一旦铺满跨度就自动退出贴合模式
+                    if (t1 - tmin) >= self.span_s * 0.95:
+                        self._auto_fit = False
+                else:
+                    t0 = span_t0
+                    self._auto_fit = False
+            else:
+                t0 = span_t0
             data = {}
             for ch in range(1, self.nch + 1):
                 for mode in ("V", "I"):
@@ -479,7 +564,7 @@ class MainWindow(QWidget):
                     data[(ch, "T")] = query_history_env(self.root, t0, t1, [ch])[ch]
                 self.plots.update_data(data)
                 self._hist_info = "数据库 %s（跨天合并）" % table
-                if not self.follow:
+                if self.follow:
                     self.plots.set_x_range(t0, t1)
 
         self.plots.set_y_auto()

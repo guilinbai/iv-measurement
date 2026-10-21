@@ -351,9 +351,12 @@ class PowerSupply:
     def output(self, on):
         """开/关输出。
 
-        本机实测：单独改控制寄存器的 OUTCTRL 位**设备不响应**（回读 PS 不变），
-        所以这里写完会**回读校验**，没生效就返回 False 并说明。
-        替代方案：把电压设成 0 V 也能等效"停止驱动"。
+        本机实测：控制寄存器 OUTCTRL 位与写线圈**设备都不响应**（PS 恒为 1，
+        且设定电压 > 0 时**实测电压仍为 0**），说明这台电源的输出使能不在串口
+        控制范围内（很可能要按面板的 OUTPUT 键）。所以这里会：
+          · 写控制字（尽力而为）
+          · **回读校验**（PS 位 + 实测电压）
+          · 没真正生效就抛异常，绝不让界面显示假的"成功"
         """
         on = bool(on)
         if self.protocol == "none":
@@ -370,16 +373,28 @@ class PowerSupply:
         if not self._write3(self._ctrl_word(out_on=on), v_raw, i_raw):
             raise PowerSupplyError("%s: 输出开关命令无响应" % self.name)
 
-        time.sleep(0.3)
+        time.sleep(0.4)
         self.read_status()
-        real = bool(self.info.get("out_on"))
-        self.out_on = real
-        if real != on:
-            raise PowerSupplyError(
-                "%s: 设备没有响应输出开关（回读仍为%s）。"
-                "可改用『把电压设为 0 V』来停止驱动"
-                % (self.name, "开" if real else "关"))
-        return on
+        ps = bool(self.info.get("out_on"))
+        volt = float(self.info.get("volt") or 0.0)
+        vset = float(self.info.get("vset") or 0.0)
+        self.out_on = ps
+
+        if on:
+            # 真要"输出"，必须看到实测电压跟上（设定>1V 时）
+            if vset > 1.0 and volt < vset * 0.5:
+                raise PowerSupplyError(
+                    "%s: 已经写了输出开（状态显示 PS=%d），但**实测电压仍为 %.2f V**"
+                    "（设定 %.2f V）。说明这台电源的输出使能不受串口控制——"
+                    "请在**电源面板上按 OUTPUT 键**让输出真正接通。"
+                    % (self.name, ps, volt, vset))
+            return True
+        else:
+            if ps:
+                raise PowerSupplyError(
+                    "%s: 设备没有响应'关输出'（PS 仍为 1）。"
+                    "可改用『把电压设为 0 V』停止驱动" % self.name)
+            return False
 
 
 # ============================================================================
