@@ -226,24 +226,29 @@ class MainWindow(QWidget):
                                                          default=1600)),
                                 env_channels=self.env_chs)
         self.plots.sig_user_range_changed.connect(self._on_user_range)
-        root.addWidget(self.plots, 1)
 
-        # ---------------- 状态 + 日志 ----------------
-        box = QHBoxLayout()
-        box.setSpacing(8)
+        # ---------------- 主体：左侧三图(3/4) + 右侧状态/日志(1/4) ----------------
+        body = QHBoxLayout()
+        body.setSpacing(6)
+        body.addWidget(self.plots, 3)          # 左侧：三个图，各占 1/3 高度
+
+        right = QVBoxLayout()
+        right.setSpacing(6)
 
         gb_state = QGroupBox("状态")
         st = QVBoxLayout(gb_state)
         self.lbl_state = QLabel("○ 未开始")
         self.lbl_state.setFont(QFont("", 10, QFont.Bold))
         st.addWidget(self.lbl_state)
-        self.lbl_stats = QLabel("轮数 —   周期 —   余量 —   点数 —   时长 —")
+        self.lbl_stats = QLabel("轮数 —\n周期 —\n余量 —\n点数 —\n时长 —")
+        self.lbl_stats.setWordWrap(True)
         st.addWidget(self.lbl_stats)
         self.lbl_store = QLabel("")
         self.lbl_store.setWordWrap(True)
+        self.lbl_store.setFont(QFont("", 8))
         st.addWidget(self.lbl_store)
         st.addStretch(1)
-        box.addWidget(gb_state, 2)
+        right.addWidget(gb_state, 1)           # 右上
 
         gb_log = QGroupBox("日志")
         lg = QVBoxLayout(gb_log)
@@ -252,9 +257,10 @@ class MainWindow(QWidget):
         self.txt_log.setMaximumBlockCount(300)
         self.txt_log.setFont(QFont("Consolas", 8))
         lg.addWidget(self.txt_log)
-        box.addWidget(gb_log, 3)
+        right.addWidget(gb_log, 1)             # 右下
 
-        root.addLayout(box, 0)
+        body.addLayout(right, 1)               # 右侧只占 1/4 宽度
+        root.addLayout(body, 1)
         self._update_store_label()
 
     @staticmethod
@@ -408,6 +414,7 @@ class MainWindow(QWidget):
         self.buf.clear()
         self.plots.clear()
         self._reset_auto_fit()
+        self.plots.set_y_auto()          # ★ 新一轮采集开始时才重置 Y 轴自动缩放
         self.n_rounds = 0
         self.t_start = time.time()
 
@@ -646,7 +653,12 @@ class MainWindow(QWidget):
                 if self.follow:
                     self._set_x(t0, t1)
 
-        self.plots.set_y_auto()
+        # ★ 不要每帧强制 Y 轴自动缩放！
+        #   之前这里调 set_y_auto() 会把用户手动缩放的 Y 轴打回自动，
+        #   表现为"滚轮缩放纵坐标后图表自己刷新"，而且三个图的 Y 会被一起重置
+        #   （看起来就像"缩放温度的纵坐标影响了电信号图"）。
+        #   pyqtgraph 的 Y 轴 autoRange 默认是开的，用户一旦手动缩放它会自己关掉，
+        #   所以我们只要**不主动干预**即可。新一轮采集开始时才重置（见 _start）。
         self._update_status(now)
 
     def _update_status(self, now):

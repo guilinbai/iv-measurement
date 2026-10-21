@@ -92,10 +92,11 @@ class TrendPlots(QWidget):
                 pen=pg.mkPen((r, g, b), width=1.8), name="T%d" % ch,
                 autoDownsample=False, clipToView=True)
 
-        lay.addWidget(self.p_v, 3)
-        lay.addWidget(self.p_i, 3)
+        # ★ 三个图等高（各占 1/3）
+        lay.addWidget(self.p_v, 1)
+        lay.addWidget(self.p_i, 1)
         if self.p_t is not None:
-            lay.addWidget(self.p_t, 2)
+            lay.addWidget(self.p_t, 1)
 
         # 记录"最后画过的数据"，用于只改变通道显隐时快速重画
         self._last = {}
