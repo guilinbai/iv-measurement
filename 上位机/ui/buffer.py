@@ -191,6 +191,11 @@ def query_history(root, t0, t1, nch=4):
 def query_history_env(root, t0, t1, channels):
     """跨天查询环境数据（温度）。
 
+    ★ v0.4.0 起温度存进了 env_round 表（一行一轮，t1/t2/dt 列，
+      与 samples 共用同一个 grid_ts）；更早的数据在旧 env 表（长表）。
+      这里**两张表都查**，新数据用 env_round，旧数据兜底用 env，
+      保证换版本之后历史曲线仍然连续。
+
     返回 {ch: (ts_array, val_array)}
     """
     chs = list(channels or [])
@@ -199,20 +204,69 @@ def query_history_env(root, t0, t1, channels):
         return out
 
     for db in list_databases(root):
+        con = None
         try:
             con = sqlite3.connect(db)
-            sql = ("SELECT ts, ch, value FROM env"
-                   " WHERE ts>=? AND ts<=? AND value IS NOT NULL ORDER BY ts")
-            for ts, ch, val in con.execute(sql, (t0, t1)):
-                if ch in out:
-                    out[ch][0].append(ts)
-                    out[ch][1].append(val)
-            con.close()
+            cols = {r[1] for r in con.execute("PRAGMA table_info(env_round)")}
+            has_round = "grid_ts" in cols
+            # 旧表是否存在
+            old_cols = {r[1] for r in con.execute("PRAGMA table_info(env)")}
+            has_old = "ts" in old_cols
+
+            # ---- 新表：env_round（一行一轮）----
+            if has_round and chs:
+                fields = []
+                for ch in chs:
+                    fields.append("t%d" % ch)
+                sql = ("SELECT grid_ts, %s FROM env_round"
+                       " WHERE grid_ts>=? AND grid_ts<=? ORDER BY grid_ts"
+                       % ", ".join(fields))
+                try:
+                    for row in con.execute(sql, (t0, t1)):
+                        ts = row[0]
+                        if ts is None:
+                            continue
+                        for i, ch in enumerate(chs):
+                            val = row[i + 1]
+                            if val is not None and ch in out:
+                                out[ch][0].append(ts)
+                                out[ch][1].append(val)
+                except Exception:
+                    pass
+
+            # ---- 旧表兜底：env（长表）----
+            if has_old:
+                sql = ("SELECT ts, ch, value FROM env"
+                       " WHERE ts>=? AND ts<=? AND value IS NOT NULL ORDER BY ts")
+                try:
+                    for ts, ch, val in con.execute(sql, (t0, t1)):
+                        if ch in out and ts is not None:
+                            out[ch][0].append(ts)
+                            out[ch][1].append(val)
+                except Exception:
+                    pass
         except Exception:
             continue
+        finally:
+            if con is not None:
+                try:
+                    con.close()
+                except Exception:
+                    pass
 
-    return {ch: (np.asarray(a, dtype=float), np.asarray(b, dtype=float))
-            for ch, (a, b) in out.items()}
+    # 两张表都查过 → 同一通道的点可能重复/乱序，按时间排序去重
+    res = {}
+    for ch, (a, b) in out.items():
+        if not a:
+            res[ch] = (np.array([]), np.array([]))
+            continue
+        ta = np.asarray(a, dtype=float)
+        va = np.asarray(b, dtype=float)
+        order = np.argsort(ta, kind="mergesort")
+        ta, va = ta[order], va[order]
+        keep = np.concatenate(([True], np.diff(ta) > 1e-6))
+        res[ch] = (ta[keep], va[keep])
+    return res
 
 
 def query_count(root, t0, t1):

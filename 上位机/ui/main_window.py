@@ -721,10 +721,14 @@ class MainWindow(QWidget):
     # ==================================================================
     def _refresh(self):
         now = time.time()
-        # ★ 先看用户是不是手动缩放/平移过（滚轮也算）；是就不再自动改范围
+        # 先看用户是不是手动缩放/平移过（滚轮也算）；是就不再自动改范围
         self._detect_user_zoom()
-        # ≤2 小时用内存缓冲（有实时数据）；更长的跨度去数据库查（原始/聚合表）
-        realtime = self.span_s <= 7200 and (self.follow or self.worker is None)
+        # ★ 是否用内存缓冲：只看"跨度是否在缓冲能覆盖的范围内"。
+        #   之前还带了个 (self.follow or ...) 的条件，导致一旦手动缩放（follow=False）
+        #   就强制走数据库分支，而数据库历史查询那条路对温度的取数容易出问题
+        #   —— 表现就是"滚轮缩放横坐标后温度曲线消失"。
+        #   缓冲 maxlen=60000，按 2 秒一轮能覆盖 30 小时以上，所以 2 小时内完全够用。
+        realtime = self.span_s <= 7200
 
         if realtime:
             t1 = now
