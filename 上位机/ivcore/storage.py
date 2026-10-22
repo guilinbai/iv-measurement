@@ -115,12 +115,22 @@ class Storage:
         quality  INTEGER DEFAULT 0
     );
 
+    -- ★ 温度宽表（一行一轮）：与 samples 用**同一个 grid_ts**，
+    --   等价于 _samples.csv 里的 t1/t2/dt 三列，方便 SQL 直接和电学量按轮关联
+    CREATE TABLE IF NOT EXISTS env_round (
+        grid_ts  REAL PRIMARY KEY,
+        run_id   INTEGER,
+        round_id INTEGER,
+        t1       REAL,
+        t2       REAL,
+        dt       REAL
+    );
+
     CREATE TABLE IF NOT EXISTS agg_1min (
         bucket INTEGER, ch INTEGER, mode TEXT,
         v_min REAL, v_max REAL, v_avg REAL, n INTEGER,
         PRIMARY KEY (bucket, ch, mode)
-    );
-    CREATE TABLE IF NOT EXISTS agg_1hour (
+    );    CREATE TABLE IF NOT EXISTS agg_1hour (
         bucket INTEGER, ch INTEGER, mode TEXT,
         v_min REAL, v_max REAL, v_avg REAL, n INTEGER,
         PRIMARY KEY (bucket, ch, mode)
@@ -143,11 +153,16 @@ class Storage:
         self.env_channels = list(env_channels or [])
         self.verbose = verbose
 
-        # 宽表列：iso_time, round_id, v1, i1, v2, i2, ...
+        # 宽表列：iso_time, round_id, v1, i1, v2, i2, ... , t1, t2, dt
+        # ★ 温度与电学量**同一轮、同一时间戳**，所以合并在同一个宽表里，
+        #   自变量统一为 iso_time（一行 = 一轮 = 一个时刻的全部数据）。
         self.csv_cols = list(HEAD_COLS)
         for ch in range(1, self.nch + 1):
             self.csv_cols += ["v%d" % ch, "i%d" % ch]
-
+        for ch in self.env_channels:
+            self.csv_cols.append("t%d" % ch)
+        if len(self.env_channels) >= 2:
+            self.csv_cols.append("dt")
 
         self.con = None
         self.db = None
@@ -210,6 +225,27 @@ class Storage:
 
         if self.write_csv:
             csv_path = os.path.join(d, "%s_samples.csv" % day)
+            # ★ 表头与当前列不一致（例如旧版本 11 列、新增温度后 13 列）
+            #   → 把旧文件归档，绝不能让新旧格式混在同一个文件里
+            if os.path.exists(csv_path) and os.path.getsize(csv_path) > 0:
+                try:
+                    with open(csv_path, "r", encoding="utf-8") as f:
+                        old_head = (f.readline() or "").strip()
+                    if old_head and old_head.split(",") != self.csv_cols:
+                        bak = csv_path.replace(".csv", "_oldformat.csv")
+                        n = 1
+                        while os.path.exists(bak):
+                            bak = csv_path.replace(".csv", "_oldformat%d.csv" % n)
+                            n += 1
+                        os.replace(csv_path, bak)
+                        if self.verbose:
+                            print("      [%s] 表头已变更（旧 %d 列 / 新 %d 列），"
+                                  "旧文件归档为 %s"
+                                  % (day, len(old_head.split(",")),
+                                     len(self.csv_cols), os.path.basename(bak)))
+                except Exception:
+                    pass
+
             new = (not os.path.exists(csv_path)) or os.path.getsize(csv_path) == 0
             self.csv_file = open(csv_path, "a", newline="", encoding="utf-8")
             self.csv_writer = csv.writer(self.csv_file)
@@ -357,7 +393,7 @@ class Storage:
     # ------------------------------------------------------------------
     #  写一轮
     # ------------------------------------------------------------------
-    def write_round(self, samples, grid_ts=None, round_id=None):
+    def write_round(self, samples, grid_ts=None, round_id=None, env=None):
         """写一轮数据。
 
         samples : [(ts, ch, mode, value, unit, quality), ...]
@@ -365,6 +401,9 @@ class Storage:
                   以保证时间列不断档。
         grid_ts : 本轮的"网格时刻"（严格等间隔）。缺省用第一个点或现在。
         round_id: 轮号。缺省用 self.round_id（需先 begin_round()）。
+        env     : {通道: 温度℃} 或 None —— ★ 与这一轮同一次采样的温度，
+                  会写进 samples 表的 t1/t2/dt 列和同一个 CSV 行，
+                  这样电学量与温度就是**同一时间自变量**下的同一行数据。
         """
         if round_id is None:
             round_id = self.round_id
@@ -372,6 +411,15 @@ class Storage:
             grid_ts = samples[0][0] if samples else time.time()
 
         self._rollover(ts=grid_ts)
+
+        # ---- 温度（与电学量同一行）----
+        env = env or {}
+        tvals = []
+        for ch in self.env_channels:
+            tvals.append(env.get(ch))
+        t1 = tvals[0] if len(tvals) >= 1 else None
+        t2 = tvals[1] if len(tvals) >= 2 else None
+        dt = (t1 - t2) if (t1 is not None and t2 is not None) else None
 
         # ---- SQLite（长表，保留精确信息）----
         rows = [(ts, grid_ts, self.run_id, round_id, ch, mode, val, unit, q)
@@ -383,6 +431,17 @@ class Storage:
             self.con.commit()
             self.n_written += len(rows)
 
+        # ---- 温度：写进 env_round 宽表（一行一轮，与 samples 同一 grid_ts）----
+        if any(v is not None for v in tvals):
+            self.con.execute(
+                "INSERT INTO env_round (grid_ts, run_id, round_id,"
+                " t1, t2, dt) VALUES (?,?,?,?,?,?)"
+                " ON CONFLICT(grid_ts) DO UPDATE SET"
+                "   t1=excluded.t1, t2=excluded.t2, dt=excluded.dt",
+                (grid_ts, self.run_id, round_id, t1, t2, dt))
+            self.con.commit()
+            self.n_env += sum(1 for v in tvals if v is not None)
+
         # ---- 轮记录（空轮也留痕，保证时间列不断档、校验准确）----
         n_bad = sum(1 for s in samples if s[3] is None)
         self.con.execute(
@@ -393,13 +452,20 @@ class Storage:
             (grid_ts, round_id, self.run_id, len(rows), n_bad))
         self.con.commit()
 
-        # ---- CSV（宽表，一行一轮）----
+        # ---- CSV（宽表，一行一轮：电学量 + 温度，统一时间自变量）----
         if self.csv_writer:
             d = {}
             for (ts, ch, mode, val, unit, q) in samples:
                 d["%s%d" % (mode.lower(), ch)] = val
             row = [_iso_sec(grid_ts), round_id]
-            row += [_fmt_val(d.get(c)) for c in self.csv_cols[2:]]
+            for c in self.csv_cols[2:]:
+                if c == "dt":
+                    row.append("" if dt is None else "%.2f" % dt)
+                elif c.startswith("t"):
+                    v = env.get(int(c[1:])) if c[1:].isdigit() else None
+                    row.append("" if v is None else "%.2f" % v)
+                else:
+                    row.append(_fmt_val(d.get(c)))
             self.csv_writer.writerow(row)
             self.csv_file.flush()               # 实时副本：立刻落盘
             self.n_csv += 1

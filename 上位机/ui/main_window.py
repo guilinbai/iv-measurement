@@ -15,6 +15,7 @@
   · 关窗时先让采集线程优雅收尾（Arduino 回安全态、校验 CSV 再退出）
 """
 
+import json
 import os
 import queue
 import shutil
@@ -35,6 +36,30 @@ from .worker import AcquisitionWorker, FakeWorker, EnvWorker
 
 # 视图范围：名称 -> 秒
 SPANS = [("10 分钟", 600), ("1 小时", 3600), ("1 天", 86400), ("7 天", 604800)]
+
+# 界面状态文件（记住上次的采样间隔、视图跨度等）
+STATE_FILE = "ui_state.json"
+
+
+def _fmt_num(v, unit):
+    """按量级自动选单位：V → V/mV/µV；A → A/mA/µA/nA。"""
+    try:
+        a = abs(v)
+    except Exception:
+        return "—"
+    if unit == "V":
+        if a >= 1.0:
+            return "%.4f V" % v
+        if a >= 1e-3:
+            return "%.2f mV" % (v * 1e3)
+        return "%.1f µV" % (v * 1e6)
+    if a >= 1.0:
+        return "%.3f A" % v
+    if a >= 1e-3:
+        return "%.2f mA" % (v * 1e3)
+    if a >= 1e-6:
+        return "%.2f µA" % (v * 1e6)
+    return "%.1f nA" % (v * 1e9)
 
 
 class MainWindow(QWidget):
@@ -67,10 +92,13 @@ class MainWindow(QWidget):
         self._last_set_xr = None
         # 温度超限保护是否已触发（避免重复关电源）
         self._overheat_tripped = False
+        # 最近一轮各路数值 {(ch, "V"|"I"): value}，供状态栏显示
+        self.last_samples = {}
 
         self.setWindowTitle("4 路 IV 测量 · 实时监视  (v0.3 · 含温度)")
         self.resize(1280, 900)
         self._build_ui()
+        self._restore_state()          # ★ 恢复上次的采样间隔/视图跨度等
 
         # 刷新定时器（限帧 3 Hz —— 人眼看曲线不需要更高）
         self.timer = QTimer(self)
@@ -292,6 +320,87 @@ class MainWindow(QWidget):
             self.lbl_hint.setStyleSheet("color:#c0392b; font-weight:bold;")
 
     # ------------------------------------------------------------------
+    #  界面状态记忆（采样间隔 / 视图跨度 / 电压源设定 …）
+    # ------------------------------------------------------------------
+    def _state_path(self):
+        return os.path.join(os.path.dirname(os.path.abspath(self.cfg.path)),
+                            STATE_FILE)
+
+    def _load_state(self):
+        try:
+            with open(self._state_path(), "r", encoding="utf-8") as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_state(self):
+        """把"下次打开还想保持的界面设置"存到 ui_state.json。"""
+        st = {"_note": "界面状态记忆文件，删掉即恢复默认。由程序自动写入。"}
+        try:
+            st["interval_s"] = round(float(self.spin_interval.value()), 4)
+            st["span_hours"] = round(self.span_s / 3600.0, 5)
+            st["fake"] = bool(self.chk_fake.isChecked())
+            if hasattr(self, "spin_span"):
+                st["span_hours_input"] = round(float(self.spin_span.value()), 4)
+            if hasattr(self, "spin_volt"):
+                st["volt_set"] = round(float(self.spin_volt.value()), 3)
+            if hasattr(self, "spin_cur"):
+                st["curr_set"] = round(float(self.spin_cur.value()), 4)
+            if getattr(self, "chk_ch", None):
+                st["channels"] = {str(k): bool(v.isChecked())
+                                  for k, v in self.chk_ch.items()}
+        except Exception:
+            pass
+        try:
+            with open(self._state_path(), "w", encoding="utf-8") as f:
+                json.dump(st, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self._append_log("[!] 保存界面状态失败: %s" % str(e)[:60])
+
+    def _restore_state(self):
+        """启动时恢复上次的界面设置。"""
+        st = self._load_state()
+        if not st:
+            return
+        applied = []
+        try:
+            if "interval_s" in st:
+                v = float(st["interval_s"])
+                lo, hi = self.spin_interval.minimum(), self.spin_interval.maximum()
+                v = max(lo, min(hi, v))
+                self.spin_interval.setValue(v)
+                applied.append("间隔 %.2f s" % v)
+            if "span_hours" in st:
+                v = float(st["span_hours"]) * 3600.0
+                if v >= 60:
+                    self.span_s = v
+                    applied.append("视图 %.2f 小时" % (v / 3600.0))
+            if hasattr(self, "spin_span") and "span_hours_input" in st:
+                self.spin_span.setValue(float(st["span_hours_input"]))
+            if hasattr(self, "spin_volt") and "volt_set" in st:
+                v = float(st["volt_set"])
+                v = max(self.spin_volt.minimum(), min(self.spin_volt.maximum(), v))
+                self.spin_volt.setValue(v)
+                applied.append("电压 %.2f V" % v)
+            if hasattr(self, "spin_cur") and "curr_set" in st:
+                a = float(st["curr_set"])
+                a = max(self.spin_cur.minimum(), min(self.spin_cur.maximum(), a))
+                self.spin_cur.setValue(a)
+                applied.append("上限电流 %.3f A" % a)
+            if getattr(self, "chk_ch", None) and isinstance(st.get("channels"), dict):
+                for k, on in st["channels"].items():
+                    cb = self.chk_ch.get(int(k)) if k.isdigit() else None
+                    if cb is not None:
+                        cb.setChecked(bool(on))
+        except Exception as e:
+            self._append_log("[!] 恢复界面状态出错: %s" % str(e)[:60])
+
+        if applied:
+            self._append_log("已恢复上次设置：%s" % "，".join(applied))
+        self._update_interval_hint()
+
+    # ------------------------------------------------------------------
     #  电压源操作
     # ------------------------------------------------------------------
     def _connect_ps(self):
@@ -507,6 +616,11 @@ class MainWindow(QWidget):
         self.buf.add_round(samples)
         self.n_rounds = rno
         self.last_lag = lag
+        # 记住本轮各路数值，供状态栏显示
+        self.last_samples = {}
+        for (ts, ch, mode, val, unit, q) in samples:
+            if val is not None:
+                self.last_samples[(ch, mode)] = val
 
     def _on_stats(self, stats):
         if stats:
@@ -620,13 +734,17 @@ class MainWindow(QWidget):
             if self._auto_fit:
                 tmin, _tmax = self.buf.span()
                 if tmin is not None and tmin > span_t0:
+                    # 数据还不够铺满跨度 → 从数据起点开始显示
                     t0 = tmin
-                    # 数据一旦铺满跨度就自动退出贴合模式
                     if (t1 - tmin) >= self.span_s * 0.95:
-                        self._auto_fit = False
+                        self._auto_fit = False      # 铺满了，自然过渡到固定跨度
                 else:
                     t0 = span_t0
-                    self._auto_fit = False
+                    # ★ 只有"确实有数据"且已经铺满跨度时才退出贴合模式；
+                    #   没数据时（刚启动）保持 _auto_fit=True，否则一旦有一次
+                    #   空刷新就会永久退化成大跨度视图，导致曲线挤在最右边看不见。
+                    if tmin is not None and (t1 - tmin) >= self.span_s * 0.95:
+                        self._auto_fit = False
             else:
                 t0 = span_t0
             data = {}
@@ -668,24 +786,37 @@ class MainWindow(QWidget):
         h, rem = divmod(int(dur), 3600)
         m, s = divmod(rem, 60)
 
-        # 温度与温差（用户最关心 ΔT）
-        t_txt = ""
+        lines = [
+            "轮数 %d" % self.n_rounds,
+            "周期 %.2f s" % self.spin_interval.value(),
+            "余量 %s" % lag_txt,
+            "点数 %d" % self.buf.n_total,
+            "时长 %d:%02d:%02d" % (h, m, s),
+            "来源 %s" % (self._hist_info or "—"),
+        ]
+
+        # ★ 四路电压 / 电流的当前值
+        lines.append("")
+        for ch in range(1, self.nch + 1):
+            v = self.last_samples.get((ch, "V"))
+            i = self.last_samples.get((ch, "I"))
+            lines.append("通道%d  V %-10s I %s"
+                         % (ch,
+                            "—" if v is None else _fmt_num(v, "V"),
+                            "—" if i is None else _fmt_num(i, "A")))
+
+        # 温度与温差（ΔT 是用户最关心的）
         if self.env_chs:
-            parts = []
+            lines.append("")
+            vals = []
             for ch in self.env_chs:
                 v = self.buf.env_latest.get(ch)
-                parts.append("T%d=%s" % (ch, "—" if v is None else "%.1f" % v))
-            if len(self.env_chs) >= 2:
-                a = self.buf.env_latest.get(self.env_chs[0])
-                b = self.buf.env_latest.get(self.env_chs[1])
-                if a is not None and b is not None:
-                    parts.append("ΔT=%.1f ℃" % (a - b))
-            t_txt = "   " + "  ".join(parts) + " ℃"
+                vals.append(v)
+                lines.append("T%d   %s" % (ch, "—" if v is None else "%.1f ℃" % v))
+            if len(self.env_chs) >= 2 and vals[0] is not None and vals[1] is not None:
+                lines.append("ΔT   %.1f ℃" % (vals[0] - vals[1]))
 
-        self.lbl_stats.setText(
-            "轮数 %d   周期 %.2f s   余量 %s   点数 %d   时长 %d:%02d:%02d   来源 %s%s"
-            % (self.n_rounds, self.spin_interval.value(), lag_txt,
-               self.buf.n_total, h, m, s, self._hist_info or "—", t_txt))
+        self.lbl_stats.setText("\n".join(lines))
 
     def _update_store_label(self):
         try:
@@ -742,6 +873,9 @@ class MainWindow(QWidget):
         return False
 
     def closeEvent(self, e):
+        # ★ 记住界面设置（下次打开还是这些值）
+        self._save_state()
+
         # ★★★ 第一优先：先关电源输出（防止加热器无人看管）★★★
         if self.ps:
             self._shutdown_power("关闭窗口")

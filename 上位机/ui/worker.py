@@ -162,45 +162,50 @@ class AcquisitionWorker(QThread):
         self.storage.start_run(snap)
 
         # --- 采集 ---
+        # env_provider: 每轮写盘前读一次温度，与电学量一起写进同一条记录
         self.acq = Acquisition(cfg, self.arduino, self.dmm_v, self.dmm_i,
-                               self.storage, log=self._log)
+                               self.storage, log=self._log,
+                               env_provider=self._read_temp)
         self.acq.interval = self.interval
 
         self.arduino.safe()
         self.sig_state_msg.emit("running", "采集中")
 
         def on_round(rno, samples, t_round, lag):
-            self._read_env()                  # ★ 每轮采一次温度（与测量同一轮）
             self.sig_round.emit(rno, (samples, t_round, lag))
 
         self.stats = self.acq.run(max_rounds=self.max_rounds,
                                   stop_flag=lambda: self._stop,
                                   on_round=on_round)
 
-    def _read_env(self):
-        """每轮采一次温度（与测量同一轮、同一 grid_ts / round_id）。"""
-        if not self.tas or not self.storage or not self.acq:
-            return
+    def _read_temp(self):
+        """读一次温度，返回 {通道: 温度℃}。
+
+        由 scheduler 在**写盘前**调用，所以温度和这一轮的电学量是
+        同一次采样、同一个 grid_ts —— 会一起写进同一条记录里。
+        这里不写盘（交给 storage.write_round 统一写）。
+        """
+        if not self.tas:
+            return None
         ta = self.cfg["devices"]["tasensor"]
         try:
             vals = self.tas.read_temperatures(channels=ta["channels"],
                                               invalid_above=ta["invalid_above"])
+            self._env_ok += 1
         except Exception as e:
             self._env_fail += 1
             if self._env_fail in (1, 10) or self._env_fail % 100 == 0:
                 self._log("[!] 温度读取失败(%d次): %s" % (self._env_fail, str(e)[:70]))
-            return
-        gts = self.acq.last_grid_ts
+            return None
+        # 通知界面：画温度曲线 + 超温保护
         try:
-            self.storage.write_env(vals, ts=time.time(), grid_ts=gts,
-                                   round_id=self.storage.round_id)
-            self.sig_env.emit(gts or time.time(), vals)
-            self._env_ok += 1
-        except Exception as e:
-            self._log("[!] 温度写盘失败: %s" % str(e)[:70])
+            self.sig_env.emit(self.acq.last_grid_ts or time.time(), vals)
+        except Exception:
+            pass
+        return vals
 
     def _drain_env(self, max_n=200):
-        """兼容旧接口（现在温度已随轮直接落盘，不再需要队列）。"""
+        """兼容旧接口（温度已随每轮一起写入，不再需要队列）。"""
         pass
 
     # ------------------------------------------------------------------

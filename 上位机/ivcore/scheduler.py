@@ -24,13 +24,16 @@ QUALITY_BAD = 2
 
 
 class Acquisition:
-    def __init__(self, cfg, arduino, dmm_v, dmm_i, storage, log=print):
+    def __init__(self, cfg, arduino, dmm_v, dmm_i, storage, log=print,
+                 env_provider=None):
         self.cfg = cfg
         self.arduino = arduino
         self.dmm_v = dmm_v
         self.dmm_i = dmm_i
         self.storage = storage
         self.log = log
+        # ★ 每轮写盘前调用，返回 {通道: 温度℃}；温度与这一轮的电学量同一次采样
+        self.env_provider = env_provider
 
         self.interval = float(cfg["acquisition"]["interval_s"])
         self.nch = int(cfg["acquisition"]["channels"])
@@ -118,7 +121,18 @@ class Acquisition:
 
         self.n_samples += len(samples)
         self.last_grid_ts = grid_ts       # 供外部（温度采集）对齐同一轮用
-        self.storage.write_round(samples, grid_ts=grid_ts, round_id=rid)
+
+        # ★ 取本轮的温度（与电学量同一次采样），和 samples 一起写盘
+        env = None
+        if self.env_provider is not None:
+            try:
+                env = self.env_provider()
+            except Exception as e:
+                self.log("      [!] 温度采样失败: %s" % str(e)[:70])
+                env = None
+                self.storage.event("WARN", "tasensor", str(e)[:200])
+
+        self.storage.write_round(samples, grid_ts=grid_ts, round_id=rid, env=env)
         return samples, t_round
 
     # ------------------------------------------------------------------
