@@ -111,11 +111,30 @@ class TrendPlots(QWidget):
 
     # ------------------------------------------------------------------
     def set_channel_visible(self, ch, visible):
+        """显示/隐藏某一路的**电学量**曲线（V 和 I）。
+
+        ★ 不动温度曲线：温度通道虽然也叫 ch1/ch2，但和电学通道是
+          两个不同的物理量，界面上也有各自独立的勾选框。
+        """
         self.enabled[ch] = bool(visible)
-        for mode in ("V", "I", "T"):
+        for mode in ("V", "I"):
             c = self.curves.get((ch, mode))
             if c is not None:
-                c.setVisible(self.enabled[ch])
+                c.setVisible(bool(visible))
+
+    def set_env_visible(self, ch, visible):
+        """单独显示/隐藏某一路的**温度**曲线（与电学通道互不影响）。"""
+        self.env_enabled = getattr(self, "env_enabled", {})
+        self.env_enabled[ch] = bool(visible)
+        c = self.curves.get((ch, "T"))
+        if c is not None:
+            c.setVisible(bool(visible))
+
+    def get_channel_visible(self, ch):
+        return bool(self.enabled.get(ch, True))
+
+    def get_env_visible(self, ch):
+        return bool(getattr(self, "env_enabled", {}).get(ch, True))
 
     # ------------------------------------------------------------------
     def set_x_range(self, t0, t1, emit_guard=True):
