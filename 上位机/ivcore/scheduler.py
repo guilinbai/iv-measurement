@@ -62,10 +62,12 @@ class Acquisition:
                  所以 CSV 里每行的时间差恒等于采样间隔。
         """
         self.round_no += 1
-        rid = self.storage.begin_round()          # 轮号在当天内连续（跨重启不重置）
         if grid_ts is None:
             grid_ts = (self.t_grid0 + (self.round_no - 1) * self.interval
                        if self.t_grid0 else time.time())
+        # ★ 先算出 grid_ts 再分配轮号：begin_round 内部会按这个时刻切库，
+        #   跨零点时才不会把昨天的轮号带进新的一天。
+        rid = self.storage.begin_round(grid_ts)
         samples = []
         t_round = time.time()
 

@@ -254,38 +254,17 @@ class Storage:
                 self.csv_file.flush()
             self.n_csv = self._count_csv_rows(csv_path)
 
-            # 环境数据单独一个 CSV（一行一轮，与 samples 的 round_id 对齐）
-            if self.env_channels:
-                env_path = os.path.join(d, "%s_env.csv" % day)
-                # ★ 表头与当前列不一致（例如旧版本是 4 列）→ 把旧文件归档，避免格式混在一起
-                if os.path.exists(env_path) and os.path.getsize(env_path) > 0:
-                    try:
-                        with open(env_path, "r", encoding="utf-8") as f:
-                            old_head = (f.readline() or "").strip()
-                        if old_head and old_head.split(",") != self.env_cols:
-                            bak = env_path.replace(".csv", "_oldformat.csv")
-                            n = 1
-                            while os.path.exists(bak):
-                                bak = env_path.replace(".csv", "_oldformat%d.csv" % n)
-                                n += 1
-                            os.replace(env_path, bak)
-                            if self.verbose:
-                                print("      环境 CSV 表头已变更（旧: %s），"
-                                      "旧文件已归档为 %s"
-                                      % (old_head, os.path.basename(bak)))
-                    except Exception:
-                        pass
-                new_env = (not os.path.exists(env_path)) or os.path.getsize(env_path) == 0
-                self.env_file = open(env_path, "a", newline="", encoding="utf-8")
-                self.env_writer = csv.writer(self.env_file)
-                if new_env:
-                    self.env_writer.writerow(self.env_cols)
-                    self.env_file.flush()
+            # ★ 不再创建 _env.csv：v0.4.0 起温度已并入 _samples.csv 的
+            #   t1/t2/dt 三列（同一行、同一时间自变量），单独的环境 CSV 已废弃。
+            #   历史遗留的 _env.csv 保留不动（里面的旧数据仍然有效）。
+            legacy = os.path.join(d, "%s_env.csv" % day)
+            if os.path.exists(legacy) and os.path.getsize(legacy) > 64 and self.verbose:
+                print("      (提示: 发现旧格式 %s，其中数据已合并进 %s_samples.csv，"
+                      "确认后可自行删除)" % (os.path.basename(legacy), day))
 
         if self.verbose:
-            print("      存储: %s  (宽表 %d 列, 已有轮号到 %d%s)"
-                  % (db_path, len(self.csv_cols), self.round_id,
-                     "，环境 CSV %d 列" % len(self.env_cols) if self.env_channels else ""))
+            print("      存储: %s  (宽表 %d 列, 已有轮号到 %d)"
+                  % (db_path, len(self.csv_cols), self.round_id))
         return True
 
     def _migrate(self):
@@ -357,8 +336,14 @@ class Storage:
     def round_base(self):
         return getattr(self, "_round_base", 0)
 
-    def begin_round(self):
-        """分配一个新轮号（当天内连续）。"""
+    def begin_round(self, ts=None):
+        """分配一个新轮号（同一天内连续，跨天从 1 重新开始）。
+
+        ★ 必须先按本轮的时间切库再分配轮号：之前是先分配、后由
+          write_round() 切库，导致跨零点那一轮拿到了昨天的大轮号，
+          下一条又从 1 开始 —— CSV 里 round_id 出现 48680 → 1 的跳变。
+        """
+        self._rollover(ts=ts)
         self.round_id += 1
         return self.round_id
 
