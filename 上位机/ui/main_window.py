@@ -470,7 +470,11 @@ class MainWindow(QWidget):
             self._ps_dead = False
 
     def _ps_health(self):
-        """定期健康检查：只读状态、**不自动重连**（避免主线程卡住）。"""
+        """定期健康检查：只读状态、**不自动重连**（避免主线程卡住）。
+
+        ★ 必须**连续失败**才判定"断开"：串口偶发丢一帧很常见，
+          一次失败就报红字会让用户以为电源出问题了。
+        """
         if not self.ps:
             return
         try:
@@ -478,18 +482,27 @@ class MainWindow(QWidget):
         except Exception:
             ok = False
         if not ok:
+            self._ps_fail_count = getattr(self, "_ps_fail_count", 0) + 1
+            if self._ps_fail_count < 3:
+                # 偶发失败：不改显示，等下一次
+                return
             if not self._ps_dead:
                 self._ps_dead = True
                 self._append_log(
-                    "[!] 电源串口失去响应（USB 掉线？）。"
-                    "点电压源那一行的『重连』按钮即可恢复，不用重启软件")
+                    "[!] 电源串口连续 %d 次无响应（USB 掉线？）。"
+                    "点电压源那一行的『重连』按钮即可恢复，不用重启软件"
+                    % self._ps_fail_count)
             self.btn_out.setText("输出：?")
-            self.lbl_ps.setText("⚠ 已断开 —— 请拔插 USB 后点『重连』")
+            self.lbl_ps.setText("⚠ 已断开（连续 %d 次无响应）—— 拔插 USB 后点『重连』"
+                                % self._ps_fail_count)
             self.lbl_ps.setStyleSheet("color:#c0392b; font-weight:bold;")
             return
-        if self._ps_dead:
+        # 成功
+        if getattr(self, "_ps_fail_count", 0):
+            if self._ps_dead:
+                self._append_log("电源串口已恢复通信")
+            self._ps_fail_count = 0
             self._ps_dead = False
-            self._append_log("电源串口已恢复通信")
 
     def _refresh_ps_label(self):
         if not self.ps:
@@ -506,11 +519,15 @@ class MainWindow(QWidget):
         i = self.ps.info
         self.btn_out.setText("输出：%s" % ("开" if i["out_on"] else "关"))
         self.btn_out.setChecked(bool(i["out_on"]))
+        # ★ "实测"和"设定"必须区分清楚：恒压时两者电压接近、电流由负载决定；
+        #   恒流时电流达到上限、电压被负载拉低。用户很容易把"实测 120mA"
+        #   当成"设定 500mA 没生效"，所以这里用箭头分开、单位统一成 mA。
+        mode_txt = ("恒压 CV" if i["cv"]
+                    else "恒流 CC（已到限流，电压由负载决定）")
         self.lbl_ps.setText(
-            "实测 %.3f V / %.3f A   设定 %.2f V / %.3f A   %s%s"
-            % (i["volt"], i["curr"], i["vset"], i["iset"],
-               "恒压" if i["cv"] else "恒流",
-               "  ⚠报警" if i["alarm"] else ""))
+            "实测 → %.3f V / %.1f mA     设定 ← %.2f V / %.0f mA     %s%s"
+            % (i["volt"], i["curr"] * 1000.0, i["vset"], i["iset"] * 1000.0,
+               mode_txt, "   ⚠报警" if i["alarm"] else ""))
         color = "#c0392b" if i["alarm"] else "#1a7f37" if i["out_on"] else "#666"
         self.lbl_ps.setStyleSheet("color:%s;" % color)
 
@@ -563,12 +580,24 @@ class MainWindow(QWidget):
             self._connect_ps()
         if not self.ps:
             return
+        # ★ 先刷新真实状态再决定要切到哪个方向。
+        #   之前直接用缓存的 self.ps.out_on，如果那之后设备状态变了
+        #   （面板按键、拔插 USB 复位、上一次读失败），就会切反。
+        try:
+            self.ps.read_status(_retry=False)
+        except Exception:
+            pass
         want = not bool(self.ps.out_on)
         try:
             self.ps.output(want)
             self._append_log("电压源输出 → %s" % ("开" if want else "关"))
         except Exception as e:
             self._append_log("[!] 输出开关失败: %s" % e)
+            # 失败时把按钮状态纠正回设备的真实状态
+            try:
+                self.ps.read_status(_retry=False)
+            except Exception:
+                pass
         self._refresh_ps_label()
 
     # ==================================================================
