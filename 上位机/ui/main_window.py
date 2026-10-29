@@ -206,6 +206,7 @@ class MainWindow(QWidget):
         ps_cfg = self.cfg["devices"]["powersupply"]
         self.ps = None
         self._ps_last_read = 0.0
+        self._ps_dead = False       # 电源串口是否已失联
         if ps_cfg.get("enabled"):
             bar = QHBoxLayout()
             bar.setSpacing(8)
@@ -242,6 +243,15 @@ class MainWindow(QWidget):
             self.btn_out.setCheckable(True)
             self.btn_out.clicked.connect(self._toggle_output)
             bar.addWidget(self.btn_out)
+
+            # ★ 重连按钮：USB 转串口拔插/掉线后，不用重启软件
+            self.btn_ps_reconnect = QPushButton("重连")
+            self.btn_ps_reconnect.setMaximumWidth(58)
+            self.btn_ps_reconnect.setToolTip(
+                "电源串口掉线时点这里重新连接\n"
+                "（会先关旧串口、再自动扫描所有 COM 口找这台电源）")
+            self.btn_ps_reconnect.clicked.connect(self._reconnect_ps)
+            bar.addWidget(self.btn_ps_reconnect)
 
             self.lbl_ps = QLabel("未连接（点开始采集时连接 %s）" % ps_cfg.get("port"))
             self.lbl_ps.setStyleSheet("color:#666;")
@@ -426,14 +436,72 @@ class MainWindow(QWidget):
             self.lbl_ps.setText("连接失败：%s" % str(e)[:60])
             self.lbl_ps.setStyleSheet("color:#c0392b;")
 
+    def _reconnect_ps(self):
+        """手动重连电源（USB 拔插后不用重启软件）。"""
+        from PySide6.QtWidgets import QApplication
+        ps_cfg = self.cfg["devices"]["powersupply"]
+        if not ps_cfg.get("enabled"):
+            self._append_log("[!] 电压源在配置里是禁用的（devices.powersupply.enabled）")
+            return
+        self.lbl_ps.setText("正在重连…（会自动扫描所有 COM 口）")
+        self.lbl_ps.setStyleSheet("color:#8a6100;")
+        QApplication.processEvents()
+
+        # 已有连接 → 直接 reconnect（会重新发现端口）
+        if self.ps is not None:
+            try:
+                self.ps.reconnect(max_try=3, verbose=False)
+                self._append_log("电压源已重连: %s"
+                                 % self.ps.status_text())
+                self._ps_dead = False
+                self._refresh_ps_label()
+                return
+            except Exception as e:
+                self._append_log("[!] 重连失败: %s" % str(e)[:160])
+                self._ps_dead = True
+                self.ps = None      # 落到下面重新建对象
+
+        # 没有连接对象 → 重新建
+        self.ps = None
+        self._ps_last_read = 0.0
+        self._ps_dead = False       # 电源串口是否已失联
+        self._connect_ps()
+        if self.ps is not None:
+            self._ps_dead = False
+
+    def _ps_health(self):
+        """定期健康检查：只读状态、**不自动重连**（避免主线程卡住）。"""
+        if not self.ps:
+            return
+        try:
+            ok = self.ps.read_status(_retry=False)
+        except Exception:
+            ok = False
+        if not ok:
+            if not self._ps_dead:
+                self._ps_dead = True
+                self._append_log(
+                    "[!] 电源串口失去响应（USB 掉线？）。"
+                    "点电压源那一行的『重连』按钮即可恢复，不用重启软件")
+            self.btn_out.setText("输出：?")
+            self.lbl_ps.setText("⚠ 已断开 —— 请拔插 USB 后点『重连』")
+            self.lbl_ps.setStyleSheet("color:#c0392b; font-weight:bold;")
+            return
+        if self._ps_dead:
+            self._ps_dead = False
+            self._append_log("电源串口已恢复通信")
+
     def _refresh_ps_label(self):
         if not self.ps:
             return
         try:
-            self.ps.read_status()
+            ok = self.ps.read_status(_retry=False)
         except Exception as e:
             self.lbl_ps.setText("读取状态失败: %s" % str(e)[:50])
             self.lbl_ps.setStyleSheet("color:#c0392b;")
+            return
+        if not ok:
+            self._ps_health()
             return
         i = self.ps.info
         self.btn_out.setText("输出：%s" % ("开" if i["out_on"] else "关"))
@@ -782,6 +850,11 @@ class MainWindow(QWidget):
         #   pyqtgraph 的 Y 轴 autoRange 默认是开的，用户一旦手动缩放它会自己关掉，
         #   所以我们只要**不主动干预**即可。新一轮采集开始时才重置（见 _start）。
         self._update_status(now)
+
+        # ★ 电源串口健康检查（每 5 秒一次，只读不重连，避免卡界面）
+        if self.ps is not None and (now - self._ps_last_read) >= 5.0:
+            self._ps_last_read = now
+            self._ps_health()
 
     def _update_status(self, now):
         lag = self.last_lag

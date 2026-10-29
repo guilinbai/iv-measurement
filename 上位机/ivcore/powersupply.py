@@ -93,31 +93,152 @@ class PowerSupply:
         self.out_on = None
 
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    #  端口自动发现（USB 转串口拔插后 COM 号可能会变）
+    # ------------------------------------------------------------------
+    # 只探测"确定是 USB 转串口"的芯片 VID。
+    # 教训：Windows 上打开蓝牙/主板自带的 COM 口会阻塞很久（几十秒到几分钟），
+    #       全端口扫描会把程序卡死。这里只扫真正插着 USB 芯片的口。
+    USB_VIDS = {0x1A86,   # CH340 / CH341（本机电源用的就是它）
+                0x2341, 0x2A03, 0x1B4F, 0x239A,   # Arduino 系
+                0x0403,  # FTDI
+                0x10C4,  # CP210x（Silicon Labs）
+                0x0483,  # STM32 虚拟串口
+                0x067B,  # PL2303
+                0x1B4F,  # SparkFun
+                }
+
+    @classmethod
+    def list_usb_ports(cls):
+        """只列出 USB 转串口的端口 [(device, vid, description), ...]"""
+        out = []
+        try:
+            from serial.tools import list_ports as lp
+            for p in lp.comports():
+                vid = getattr(p, "vid", None)
+                if vid in cls.USB_VIDS:
+                    out.append((p.device, vid, p.description or ""))
+        except Exception:
+            pass
+        return out
+
+    def find_port(self, verbose=False, max_scan=6):
+        """扫描 **USB 转串口** 的端口，找出能按当前协议应答的那个。
+
+        用途：USB 转串口拔插后 Windows 可能把 COM13 变成 COM14 / COM5，
+        或者旧端口号被别的设备占走。这里靠"发一帧读状态、看有没有正确应答"
+        来认设备，比猜端口号可靠。
+        """
+        import serial
+        cands = self.list_usb_ports()
+        if not cands:
+            return None
+        tried = []
+        for dev, _vid, desc in cands[:max_scan]:
+            if dev == self.port:
+                continue          # 原端口已经在 open() 里试过了
+            tried.append(dev)
+            old_port, old_ser = self.port, self.ser
+            self.port = dev
+            self.ser = None
+            ok = False
+            try:
+                self.ser = serial.Serial(dev, self.baud, timeout=self.timeout,
+                                         bytesize=8, parity="N", stopbits=1)
+                time.sleep(0.12)
+                self.ser.reset_input_buffer()
+                ok = self.read_status(verbose=False, _retry=False)
+            except Exception:
+                ok = False
+            finally:
+                if not ok:
+                    try:
+                        if self.ser:
+                            self.ser.close()
+                    except Exception:
+                        pass
+                    self.ser = None
+                    self.port = old_port
+            if ok:
+                if verbose:
+                    print("      在 %s (%s) 上找到了电源" % (dev, desc))
+                return dev
+        if verbose:
+            print("      扫过这些 USB 串口都没有应答: %s"
+                  % (", ".join(tried) or "（无其它 USB 串口）"))
+        return None
+
+    # ------------------------------------------------------------------
     def open(self, verbose=False):
         if self.protocol == "none":
             return "dry-run（不发送）"
         import serial
+        err = None
         try:
             self.ser = serial.Serial(self.port, self.baud, timeout=self.timeout,
                                      bytesize=8, parity="N", stopbits=1)
         except Exception as e:
-            raise PowerSupplyError("%s: 打不开 %s@%d (%s)"
-                                   % (self.name, self.port, self.baud, e))
-        time.sleep(0.15)
-        try:
-            self.ser.reset_input_buffer()
-        except Exception:
-            pass
-        ok = self.read_status(verbose=verbose)
-        if not ok:
-            raise PowerSupplyError(
-                "%s: 读不到状态（%s @ %d bps, 地址 %d）。"
-                "请检查电源是否开机、地址/波特率是否与面板设置一致"
-                % (self.name, self.port, self.baud, self.addr))
-        return "已连接 %s @%d bps 地址%d  %.3fV/%.3fA 上限%.1fV/%.1fA" % (
-            self.port, self.baud, self.addr,
-            self.info.get("volt", 0), self.info.get("curr", 0),
-            self.info.get("vmax", 0), self.info.get("imax", 0))
+            err = e
+            self.ser = None
+
+        if self.ser is not None:
+            time.sleep(0.15)
+            try:
+                self.ser.reset_input_buffer()
+            except Exception:
+                pass
+            ok = self.read_status(verbose=verbose)
+            if ok:
+                return "已连接 %s @%d bps 地址%d  %.3fV/%.3fA 上限%.1fV/%.1fA" % (
+                    self.port, self.baud, self.addr,
+                    self.info.get("volt", 0), self.info.get("curr", 0),
+                    self.info.get("vmax", 0), self.info.get("imax", 0))
+            err = "端口能打开但读不到正确应答"
+
+        # ---- 原端口不行 → 自动扫描其它端口（拔插后 COM 号变了的情况）----
+        old = self.port
+        found = self.find_port(verbose=verbose)
+        if found:
+            return ("已连接 %s（原端口 %s 已失效，自动改到新端口）@%d bps 地址%d"
+                    "  %.3fV/%.3fA" % (self.port, old, self.baud, self.addr,
+                                      self.info.get("volt", 0),
+                                      self.info.get("curr", 0)))
+
+        ports = ", ".join("%s(%s)" % (d, desc)
+                          for d, _v, desc in self.list_usb_ports()) \
+            or "（未发现 USB 串口）"
+        raise PowerSupplyError(
+            "%s: 连不上（%s @ %d bps 地址 %d）。原因：%s\n"
+            "  当前可用串口：%s\n"
+            "  处理办法：① 拔插一下电源的 USB 线，等 3 秒再点『重连』；"
+            "② 确认电源已开机；③ 确认没有被其它软件（如官方上位机）占用"
+            % (self.name, old, self.baud, self.addr, err, ports))
+
+    # ------------------------------------------------------------------
+    def reconnect(self, max_try=3, verbose=False):
+        """断线后重连：关掉旧串口 → 重新打开（含端口自动发现）。"""
+        if self.protocol == "none":
+            return True
+        self._close_serial()
+        last = None
+        for i in range(max(1, int(max_try))):
+            try:
+                msg = self.open(verbose=verbose)
+                if verbose:
+                    print("      " + msg)
+                return True
+            except Exception as e:
+                last = e
+                time.sleep(0.4 * (i + 1))     # 退避：0.4 / 0.8 / 1.2 s
+        raise PowerSupplyError("重连失败（试了 %d 次）：%s" % (max_try, str(last)[:200]))
+
+    def _close_serial(self):
+        if self.ser:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+            self.ser = None
 
     def close(self, off_output=None):
         """断开连接。
@@ -134,12 +255,7 @@ class PowerSupply:
                     self.output(False)
             except Exception:
                 pass
-        if self.ser:
-            try:
-                self.ser.close()
-            except Exception:
-                pass
-            self.ser = None
+        self._close_serial()
 
     @property
     def is_open(self):
@@ -174,10 +290,18 @@ class PowerSupply:
     # ------------------------------------------------------------------
     #  读
     # ------------------------------------------------------------------
-    def read_status(self, verbose=False):
-        """读 0x0000 起 8 个寄存器，解析成 info 字典。成功返回 True。"""
+    def read_status(self, verbose=False, _retry=True):
+        """读 0x0000 起 8 个寄存器，解析成 info 字典。成功返回 True。
+
+        串口异常（USB 掉线、端口消失）时自动重连一次再重试。
+        """
         if self.protocol == "none":
             return True
+        if self.ser is None:
+            if not _retry:
+                return False
+            self.reconnect(max_try=2, verbose=verbose)
+
         body = [self.addr, 0x03, 0x00, 0x00, 0x00, 0x08]
         frame = _with_crc(body)
         try:
@@ -185,6 +309,16 @@ class PowerSupply:
             self.ser.write(frame)
             self.ser.flush()
         except Exception as e:
+            if _retry:
+                if verbose:
+                    print("      %s: 串口异常(%s)，尝试重连…" % (self.name, str(e)[:60]))
+                try:
+                    self.reconnect(max_try=2, verbose=verbose)
+                    return self.read_status(verbose=verbose, _retry=False)
+                except Exception as e2:
+                    raise PowerSupplyError(
+                        "%s: 串口断开且重连失败 (%s / %s)"
+                        % (self.name, str(e)[:60], str(e2)[:120]))
             raise PowerSupplyError("%s: 发送失败 (%s)" % (self.name, e))
 
         need = 3 + 16 + 2
@@ -274,7 +408,7 @@ class PowerSupply:
         o = i.get("ocp", False) if ocp is None else bool(ocp)
         return ((1 if out else 0) << 8) | ((1 if o else 0) << 9)
 
-    def _write3(self, ctrl, v_raw, i_raw):
+    def _write3(self, ctrl, v_raw, i_raw, _retry=True):
         """★ 本设备固件要求：**一次写满 3 个寄存器**（start=0x0000, count=3）。
 
         实测：写单个寄存器（count=1）设备**完全不回应也不生效**；
@@ -296,11 +430,23 @@ class PowerSupply:
                 int(v_raw) & 0xFF, (int(v_raw) >> 8) & 0xFF,   # 电压：小端
                 int(i_raw) & 0xFF, (int(i_raw) >> 8) & 0xFF]   # 电流：小端
         frame = _with_crc(body)
+        if self.ser is None:
+            if not _retry:
+                return False
+            self.reconnect(max_try=2)
         try:
             self.ser.reset_input_buffer()
             self.ser.write(frame)
             self.ser.flush()
         except Exception as e:
+            if _retry:
+                try:
+                    self.reconnect(max_try=2)
+                    return self._write3(ctrl, v_raw, i_raw, _retry=False)
+                except Exception as e2:
+                    raise PowerSupplyError(
+                        "%s: 串口断开且重连失败 (%s / %s)"
+                        % (self.name, str(e)[:60], str(e2)[:120]))
             raise PowerSupplyError("%s: 发送失败 (%s)" % (self.name, e))
 
         buf = b""
