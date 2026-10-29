@@ -357,9 +357,9 @@ class MainWindow(QWidget):
                 st["volt_set"] = round(float(self.spin_volt.value()), 3)
             if hasattr(self, "spin_cur"):
                 st["curr_set"] = round(float(self.spin_cur.value()), 4)
-            if getattr(self, "chk_ch", None):
-                st["channels"] = {str(k): bool(v.isChecked())
-                                  for k, v in self.chk_ch.items()}
+            # ★ 故意**不记忆**通道勾选状态：
+            #   通道显隐是"临时看一下"的操作，不是长期设置。如果记忆了，
+            #   上次关掉的通道会让下次打开时图是空的，很容易误以为程序坏了。
         except Exception:
             pass
         try:
@@ -385,6 +385,21 @@ class MainWindow(QWidget):
                 v = float(st["span_hours"]) * 3600.0
                 if v >= 60:
                     self.span_s = v
+                    # 同步单选按钮：跨度正好等于某个预设时选中它，
+                    # 否则取消全部（表示"自定义跨度"），免得界面显示与实际不符
+                    matched = False
+                    for i, (_name, sec) in enumerate(SPANS):
+                        btn = self.span_group.button(i)
+                        if btn is not None:
+                            btn.blockSignals(True)
+                            if abs(sec - v) < 1.0:
+                                btn.setChecked(True)
+                                matched = True
+                            else:
+                                btn.setChecked(False)
+                            btn.blockSignals(False)
+                    if hasattr(self, "spin_span"):
+                        self.spin_span.setValue(v / 3600.0)
                     applied.append("视图 %.2f 小时" % (v / 3600.0))
             if hasattr(self, "spin_span") and "span_hours_input" in st:
                 self.spin_span.setValue(float(st["span_hours_input"]))
@@ -398,11 +413,14 @@ class MainWindow(QWidget):
                 a = max(self.spin_cur.minimum(), min(self.spin_cur.maximum(), a))
                 self.spin_cur.setValue(a)
                 applied.append("上限电流 %.3f A" % a)
-            if getattr(self, "chk_ch", None) and isinstance(st.get("channels"), dict):
-                for k, on in st["channels"].items():
-                    cb = self.chk_ch.get(int(k)) if k.isdigit() else None
-                    if cb is not None:
-                        cb.setChecked(bool(on))
+            # 通道勾选状态不恢复（见 _save_state 里的说明），始终默认全开
+            if getattr(self, "chk_ch", None):
+                for cb in self.chk_ch.values():
+                    cb.blockSignals(True)
+                    cb.setChecked(True)
+                    cb.blockSignals(False)
+                for ch in self.chk_ch:
+                    self.plots.set_channel_visible(ch, True)
         except Exception as e:
             self._append_log("[!] 恢复界面状态出错: %s" % str(e)[:60])
 
