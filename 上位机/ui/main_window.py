@@ -549,6 +549,21 @@ class MainWindow(QWidget):
         color = "#c0392b" if i["alarm"] else "#1a7f37" if i["out_on"] else "#666"
         self.lbl_ps.setStyleSheet("color:%s;" % color)
 
+        # ★ 让输入框跟随设备的真实设定值。否则你在面板上改了电压，界面上还是
+        #   旧数字，一点"应用"就把旧值写回去（这是同一个 bug 的界面侧表现）。
+        #   只在输入框**没有焦点**时同步，避免打断正在输入的数字。
+        try:
+            if hasattr(self, "spin_volt") and not self.spin_volt.hasFocus():
+                v = float(i.get("vset") or 0.0)
+                if abs(self.spin_volt.value() - v) > 0.005:
+                    self.spin_volt.setValue(v)
+            if hasattr(self, "spin_cur") and not self.spin_cur.hasFocus():
+                a = float(i.get("iset") or 0.0)
+                if abs(self.spin_cur.value() - a) > 0.0005:
+                    self.spin_cur.setValue(a)
+        except Exception:
+            pass
+
     def _apply_voltage(self):
         if not self.ps:
             self._connect_ps()

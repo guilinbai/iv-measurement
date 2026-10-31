@@ -402,17 +402,53 @@ class PowerSupply:
 
         状态寄存器0 的 PS(bit8) ↔ 控制寄存器 OUTCTRL(bit8)
                      OS(bit9) ↔ 控制寄存器 OCP(bit9)
+
+        out_on / ocp 传 None 表示"保持设备当前状态"。
         """
         i = self.info or {}
         out = i.get("out_on", True) if out_on is None else bool(out_on)
         o = i.get("ocp", False) if ocp is None else bool(ocp)
         return ((1 if out else 0) << 8) | ((1 if o else 0) << 9)
 
+    def _write3_merge(self, out_on=None, volts=None, amps=None, _retry=True):
+        """★ 以**设备当前实际值**为基准，只改调用者指定的项，一次写满 3 个寄存器。
+
+        为什么必须这么做（这一条是之前所有怪异现象的根源）：
+          协议要求一次写 0x0000/0x0001/0x0002 三个寄存器，所以每次操作都得
+          把另外两项也填上。如果拿**软件缓存**去填，就会覆盖掉用户在面板上做
+          的改动，例如：
+            · 面板改成 20V 后点"输出开" → 电压被改回软件的旧值
+            · 面板关掉输出后点"设电压" → 输出被意外打开
+            · 刚启动时缓存里限流是 None → 回退成 1A，偷偷改掉限流
+          正确做法：先 read_status() 拿到设备真实值，只替换要改的那一项。
+
+        out_on : True/False 改输出开关；None = 保持
+        volts  : 目标电压(V)；None = 保持设备当前设定电压
+        amps   : 目标限流(A)；None = 保持设备当前设定电流
+        """
+        if self.protocol == "none":
+            return True
+        if not self.ser:
+            if not _retry:
+                return False
+            self.reconnect(max_try=2)
+
+        # ★ 每次都重新读，绝不用缓存
+        if not self.read_status(_retry=_retry):
+            return False
+        i = self.info
+        vs = i.get("v_scale", 100.0)
+        is_ = i.get("i_scale", 1000.0)
+        ctrl = self._ctrl_word(out_on=out_on)
+        v_raw = int(round((i.get("vset") if volts is None else volts) * vs))
+        i_raw = int(round((i.get("iset") if amps is None else amps) * is_))
+        return self._write3(ctrl, v_raw, i_raw, _retry=_retry)
+
     def _write3(self, ctrl, v_raw, i_raw, _retry=True):
-        """★ 本设备固件要求：**一次写满 3 个寄存器**（start=0x0000, count=3）。
+        """底层写：一次写 3 个寄存器（0x0000 控制 / 0x0001 电压 / 0x0002 电流）。
 
         实测：写单个寄存器（count=1）设备**完全不回应也不生效**；
-              一次写 3 个（0x0000 控制 / 0x0001 电压 / 0x0002 电流）立即成功。
+              一次写 3 个立即成功。
 
         ★★★ 端序（协议 1.3）★★★
           控制寄存器 = 状态寄存器一类的"位寄存器" → **高字节先**
@@ -423,17 +459,15 @@ class PowerSupply:
         if self.protocol == "none":
             return True
         if not self.ser:
-            raise PowerSupplyError("%s: 串口未打开" % self.name)
+            if not _retry:
+                return False
+            self.reconnect(max_try=2)
 
         body = [self.addr, 0x10, 0x00, 0x00, 0x00, 0x03, 0x06,
                 (ctrl >> 8) & 0xFF, ctrl & 0xFF,              # 控制字：高字节先
                 int(v_raw) & 0xFF, (int(v_raw) >> 8) & 0xFF,   # 电压：小端
                 int(i_raw) & 0xFF, (int(i_raw) >> 8) & 0xFF]   # 电流：小端
         frame = _with_crc(body)
-        if self.ser is None:
-            if not _retry:
-                return False
-            self.reconnect(max_try=2)
         try:
             self.ser.reset_input_buffer()
             self.ser.write(frame)
@@ -458,7 +492,7 @@ class PowerSupply:
         return len(buf) >= 8 and _check_crc(buf)
 
     def set_voltage(self, volts, settle=True):
-        """设置输出电压（V）。超过设备最大电压会拒绝。"""
+        """只改输出电压，**不动**输出开关和限流（都保持设备当前值）。"""
         v = float(volts)
         if v < 0:
             raise PowerSupplyError("%s: 电压不能为负（%g）" % (self.name, v))
@@ -473,13 +507,9 @@ class PowerSupply:
             self.set_v = v
             return v
 
-        vs = self.info.get("v_scale", 100.0)
-        is_ = self.info.get("i_scale", 1000.0)
-        v_raw = int(round(v * vs))
-        i_raw = int(round((self.set_a if self.set_a is not None else 1.0) * is_))
-
-        if not self._write3(self._ctrl_word(), v_raw, i_raw):
-            raise PowerSupplyError("%s: 设置电压无响应（检查波特率/站地址）" % self.name)
+        if not self._write3_merge(volts=v):
+            raise PowerSupplyError(
+                "%s: 设置电压无响应（检查波特率/站地址）" % self.name)
 
         self.set_v = v
         if settle and self.settle_s > 0:
@@ -510,7 +540,7 @@ class PowerSupply:
         return v
 
     def set_current(self, amps, settle=False):
-        """设置限流值（A）。"""
+        """只改限流值，**不动**输出电压和输出开关。"""
         a = float(amps)
         if not self.info:
             self.read_status()
@@ -518,14 +548,14 @@ class PowerSupply:
         if a > imax + 1e-9:
             raise PowerSupplyError(
                 "%s: 设定 %.3f A 超过设备最大 %.2f A" % (self.name, a, imax))
+        if a <= 0:
+            raise PowerSupplyError("%s: 限流值必须大于 0（%g）" % (self.name, a))
+
         if self.protocol == "none":
             self.set_a = a
             return a
 
-        vs = self.info.get("v_scale", 100.0)
-        is_ = self.info.get("i_scale", 1000.0)
-        v_raw = int(round((self.set_v if self.set_v is not None else 0.0) * vs))
-        if not self._write3(self._ctrl_word(), v_raw, int(round(a * is_))):
+        if not self._write3_merge(amps=a):
             raise PowerSupplyError("%s: 设置电流无响应" % self.name)
         self.set_a = a
         if settle and self.settle_s > 0:
@@ -534,7 +564,7 @@ class PowerSupply:
         return a
 
     def output(self, on):
-        """开/关输出（写控制寄存器 bit8，高字节先）。
+        """只改输出开关，**不动**电压和限流（都保持设备当前值）。
 
         校验只信 **PS 位**（状态寄存器0 的 bit8）—— 不能用实测电压判断，
         因为电源在**恒流(CC)模式**下实测电压会明显低于设定值，那属于正常现象。
@@ -546,14 +576,9 @@ class PowerSupply:
         if not self.info:
             self.read_status()
 
-        vs = self.info.get("v_scale", 100.0)
-        is_ = self.info.get("i_scale", 1000.0)
-        v_raw = int(round((self.set_v if self.set_v is not None else 0.0) * vs))
-        i_raw = int(round((self.set_a if self.set_a is not None else 1.0) * is_))
-
         ok = False
         for attempt in range(3):                # 设备偶发不响应，重试几次
-            if not self._write3(self._ctrl_word(out_on=on), v_raw, i_raw):
+            if not self._write3_merge(out_on=on):
                 time.sleep(0.15)
                 continue
             time.sleep(0.35)
@@ -571,15 +596,16 @@ class PowerSupply:
                    bool(self.info.get("out_on"))))
 
         self.out_on = on
-        # 仅作提示：输出开了但既没电压也没电流 → 可能没接负载
+        # ★ 空载只是"提示"，绝不能抛异常 —— 此时输出**已经成功打开了**，
+        #   抛异常会让界面显示"开关失败"，反而误导用户。
         if on:
             v = float(self.info.get("volt") or 0)
             a = float(self.info.get("curr") or 0)
-            if v < 0.2 and a < 0.001:
-                raise PowerSupplyError(
-                    "%s: 输出已开启（PS=1），但实测 %.2f V / %.3f A，"
-                    "负载端似乎没接通（空载或加热器未连接）"
-                    % (self.name, v, a))
+            self.last_verify = dict(getattr(self, "last_verify", {}) or {})
+            self.last_verify["warn"] = (
+                "" if not (v < 0.2 and a < 0.001) else
+                "输出已开启（PS=1），但实测 %.2f V / %.3f A —— "
+                "负载端似乎没接通（空载或加热器未连接）" % (v, a))
         return on
 
 
