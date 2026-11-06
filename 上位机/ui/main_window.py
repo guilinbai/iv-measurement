@@ -455,40 +455,33 @@ class MainWindow(QWidget):
             self.lbl_ps.setStyleSheet("color:#c0392b;")
 
     def _reconnect_ps(self):
-        """手动重连电源（USB 拔插后不用重启软件）。"""
+        """手动重新连接电源（USB 拔插后不用重启软件）。
+
+        ★ 这里只做"关掉旧对象 → 重新 open()"，**没有自动重连机制**：
+          串口出错时协议层直接抛异常，重连必须由用户点这个按钮显式触发。
+        """
         from PySide6.QtWidgets import QApplication
         ps_cfg = self.cfg["devices"]["powersupply"]
         if not ps_cfg.get("enabled"):
             self._append_log("[!] 电压源在配置里是禁用的（devices.powersupply.enabled）")
             return
-        self.lbl_ps.setText("正在重连…（会自动扫描所有 COM 口）")
+        self.lbl_ps.setText("正在重新连接…")
         self.lbl_ps.setStyleSheet("color:#8a6100;")
         QApplication.processEvents()
 
-        # 已有连接 → 直接 reconnect（会重新发现端口）
+        # 先彻底关掉旧连接（不尝试"恢复"它）
         if self.ps is not None:
             try:
-                self.ps.reconnect(max_try=3, verbose=False)
-                self._append_log("电压源已重连: %s"
-                                 % self.ps.status_text())
-                self._ps_dead = False
-                self._refresh_ps_label()
-                return
-            except Exception as e:
-                self._append_log("[!] 重连失败: %s" % str(e)[:160])
-                self._ps_dead = True
-                self.ps = None      # 落到下面重新建对象
-
-        # 没有连接对象 → 重新建
-        self.ps = None
+                self.ps._close_serial()
+            except Exception:
+                pass
+            self.ps = None
         self._ps_last_read = 0.0
-        self._ps_dead = False       # 电源串口是否已失联
+        self._ps_dead = False
         self._connect_ps()
-        if self.ps is not None:
-            self._ps_dead = False
 
     def _ps_health(self):
-        """定期健康检查：只读状态、**不自动重连**（避免主线程卡住）。
+        """定期健康检查：只读状态，**不做任何自动重连**。
 
         ★ 必须**连续失败**才判定"断开"：串口偶发丢一帧很常见，
           一次失败就报红字会让用户以为电源出问题了。
@@ -496,7 +489,7 @@ class MainWindow(QWidget):
         if not self.ps:
             return
         try:
-            ok = self.ps.read_status(_retry=False)
+            ok = self.ps.read_status()
         except Exception:
             ok = False
         if not ok:
@@ -526,7 +519,7 @@ class MainWindow(QWidget):
         if not self.ps:
             return
         try:
-            ok = self.ps.read_status(_retry=False)
+            ok = self.ps.read_status()
         except Exception as e:
             self.lbl_ps.setText("读取状态失败: %s" % str(e)[:50])
             self.lbl_ps.setStyleSheet("color:#c0392b;")
@@ -617,7 +610,7 @@ class MainWindow(QWidget):
         #   之前直接用缓存的 self.ps.out_on，如果那之后设备状态变了
         #   （面板按键、拔插 USB 复位、上一次读失败），就会切反。
         try:
-            self.ps.read_status(_retry=False)
+            self.ps.read_status()
         except Exception:
             pass
         want = not bool(self.ps.out_on)
@@ -628,7 +621,7 @@ class MainWindow(QWidget):
             self._append_log("[!] 输出开关失败: %s" % e)
             # 失败时把按钮状态纠正回设备的真实状态
             try:
-                self.ps.read_status(_retry=False)
+                self.ps.read_status()
             except Exception:
                 pass
         self._refresh_ps_label()

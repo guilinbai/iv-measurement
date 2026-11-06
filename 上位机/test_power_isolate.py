@@ -27,7 +27,7 @@ except Exception:
 sys.path.insert(0, ".")
 
 from ivcore.powersupply import (PowerSupply, PowerSupplyError, crc16,  # noqa: E402
-                                _with_crc, _check_crc)
+                                _with_crc, _crc_ok)
 
 
 def raw_set(s, port_baud=None, ctrl=0x0100, volts=8.0, amps=0.5):
@@ -48,7 +48,7 @@ def raw_set(s, port_baud=None, ctrl=0x0100, volts=8.0, amps=0.5):
         c = s.read(8 - len(buf))
         if c:
             buf += c
-    return len(buf) >= 8 and _check_crc(buf)
+    return len(buf) >= 8 and _crc_ok(buf)
 
 
 def main(port="COM13"):
