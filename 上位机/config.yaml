@@ -70,7 +70,7 @@ devices:
     baud: 2400                  # ★ 实测（不是 9600！）
     addr: 0                     # ★ 实测（默认 0，不是 1）
     protocol: "modbus"          # modbus（真机） / none（dry-run 只记录不发送）
-    settle_s: 2.0               # 改电压后等待热稳定
+    settle_s: 2.5               # ★ 实测：PS 位立即变，但实测电压需 2.2 s 才稳定
     max_voltage: 31.0           # ★ 设备实测最大 31V；超过直接拒绝
     off_on_exit: true           # ★★ 关闭程序时关闭电源输出（防火，重要）★★
 

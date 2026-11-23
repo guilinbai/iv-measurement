@@ -428,7 +428,14 @@ class PowerSupply:
         return a
 
     def output(self, on):
-        """只改输出开关，不动电压和限流。校验只看 PS 位。"""
+        """只改输出开关，不动电压和限流。
+
+        校验分两段（这是实测延迟决定的，见文末说明）：
+          ① PS 位 —— 立即更新，等 0.4 秒就能确认命令真的进去了
+          ② 实测电压/电流 —— 约 1.3 秒后才开始变化、2.2 秒才稳定，
+             所以必须再等 settle_s 之后才读，否则读到的是上一个状态的值
+             （表现为"PS 显示输出开，实测却是 0.00V"）。
+        """
         on = bool(on)
         if self.protocol == "none":
             return on
@@ -442,28 +449,33 @@ class PowerSupply:
                 last_err = self.last_error
                 time.sleep(0.2)
                 continue
+            # ① 先确认 PS 位（立即生效）
             time.sleep(0.4)
             if not self.read_status():
                 last_err = self.last_error
                 continue
-            if self.info["out_on"] == on:
-                # 开输出后如果既没电压也没电流，只提示不报错
-                # （此时输出确实已经打开，抛异常会误导）
-                if on:
-                    self.last_verify = {
-                        "vset": self.info["vset"], "volt": self.info["volt"],
-                        "curr": self.info["curr"], "cv": self.info["cv"],
-                        "diff": self.info["volt"] - self.info["vset"],
-                        "warn": "",
-                    }
-                    if self.info["volt"] < 0.2 and self.info["curr"] < 0.001:
-                        self.last_verify["warn"] = (
-                            "输出已开（PS=1），但实测 %.2f V / %.0f mA —— "
-                            "负载端似乎没接通"
-                            % (self.info["volt"], self.info["curr"] * 1000))
-                return on
-            last_err = "PS 位没变（仍为 %d）" % self.info["out_on"]
-            time.sleep(0.2)
+            if self.info["out_on"] != on:
+                last_err = "PS 位没变（仍为 %d）" % self.info["out_on"]
+                time.sleep(0.2)
+                continue
+
+            # ② 等实测值稳定后再读一次（★ 关键：不这样会读到旧值）
+            if self.settle_s > 0:
+                time.sleep(self.settle_s)
+            self.read_status()
+
+            self.last_verify = {
+                "vset": self.info["vset"], "volt": self.info["volt"],
+                "curr": self.info["curr"], "cv": self.info["cv"],
+                "diff": self.info["volt"] - self.info["vset"], "warn": "",
+            }
+            # 开了输出但稳定后电压电流都接近 0 → 提示负载未接（此时已等够 settle）
+            if on and self.info["volt"] < 0.2 and self.info["curr"] < 0.001:
+                self.last_verify["warn"] = (
+                    "输出已开（PS=1），但稳定后实测 %.2f V / %.0f mA —— "
+                    "负载端似乎没接通（或限流设成 0 导致一开就保护）"
+                    % (self.info["volt"], self.info["curr"] * 1000))
+            return on
 
         raise PowerSupplyError(
             "%s: 连试 3 次都没能让输出%s。最后一次原因：%s\n"

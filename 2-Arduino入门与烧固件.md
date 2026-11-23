@@ -1,7 +1,12 @@
-# Arduino Nano 入门与固件编写（零基础版）
+# 第 2 步：Arduino 入门与烧固件
 
-> 目标：让你从"没用过 Arduino"到"能自己改代码、能让引脚输出脉冲、能跑通 4 路测量时序"。
-> 配套固件：**《12-固件-4路IV测量.ino》**（可直接打开上传）。
+> 上一份：[第 1 步：采购清单](1-采购清单.md)　|　下一份：[第 3 步：面包板接线](3-面包板接线.md)
+>
+> **目标**：让你从"没用过 Arduino"到"能自己改代码、能让引脚输出脉冲、能跑通 4 路测量时序"。
+> **配套固件**：[固件/IV_4CH/IV_4CH.ino](固件/IV_4CH/IV_4CH.ino)（用 Arduino IDE 直接打开上传）。
+>
+> 完全没有基础？那就从第一节开始按顺序做，每节都有"做到什么算成功"的验收标准。
+> 已经摸过 Arduino？直接跳到第四节「上传我们的 4 路固件」。
 
 ---
 
@@ -129,7 +134,7 @@ Nano D2 ──[1kΩ]── LED 长脚(＋) ── LED 短脚(－) ── Nano GN
 
 ## 四、上传我们的 4 路固件
 
-1. 用 Arduino IDE 打开 **《12-固件-4路IV测量.ino》**；
+1. 用 Arduino IDE 打开 **《IV_4CH.ino》**；
 2. 确认板子/处理器/端口选好 → 点上传；
 3. 上传成功后，打开 **工具 → 串口监视器**，右下角波特率选 **115200**；
 4. 你会看到：
@@ -201,7 +206,7 @@ PC(Python+pyvisa)                        Nano(固件)
 |---|---|---|
 | `cannot open port \\.\COM9: 拒绝访问`<br>`unable to open port COM9 for programmer` | **串口监视器独占了端口**（进程名 `serial-monitor`） | **关掉串口监视器再上传**。命令行也可确认/释放：`Get-Process serial-monitor \| Stop-Process -Force` |
 | `not in sync: resp=0x00`<br>`programmer is not responding` | **处理器选项选错**（误选了 Old Bootloader）；或 CH340 克隆板**自动复位偶发失效** | 处理器选 **ATmega328P**（**不是** Old Bootloader）；失败就**重试 1~2 次**；仍失败则"点上传后立刻按一下板上 RESET 键" |
-| IDE 提示 sketch 名无效 / 无法创建文件夹 | **sketch 名含中文**——Arduino 只允许字母、数字、下划线、连字符 | 用纯英文名（如 `arduino测试\13\13.ino`）；中文名的 .ino 删掉重建 |
+| IDE 提示 sketch 名无效 / 无法创建文件夹 | **sketch 名含中文**——Arduino 只允许字母、数字、下划线、连字符 | 用纯英文名（如 `固件\02_引脚测试\02_引脚测试.ino`）；中文名的 .ino 删掉重建 |
 
 **本机验证可用的上传配置**（照这个选，一次成功）：
 
@@ -285,3 +290,7 @@ PC(Python+pyvisa)                        Nano(固件)
 > **脉冲 = `digitalWrite(HIGH)` + `delay(一段时间)` + `digitalWrite(LOW)`。**
 > 我们的"测量时序"就是把这 5 步按顺序写出来；你只要改那几个 `T_*` 时间常数就能调快调慢。
 > 上传流程：装 IDE → 装 CH340 驱动 → 选 Nano + ATmega328P(Old Bootloader) + COMx → 点上传 → 串口监视器 115200 看日志。
+
+---
+
+**下一步** → [第 3 步：面包板接线](3-面包板接线.md)　|　返回 [README](README.md)
